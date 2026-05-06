@@ -24,12 +24,12 @@ use chrono::Utc;
 use nono::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use serde_yaml_ng as yaml;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs as unix_fs;
 use std::path::{Path, PathBuf};
-use serde_yaml_ng as yaml;
 
 /// A single declarative wiring step. Tagged by `type` so the manifest
 /// JSON reads naturally — `{ "type": "symlink", ... }`.
@@ -1162,13 +1162,15 @@ fn yaml_to_json(v: yaml::Value) -> Result<Value> {
                 // Reject non-finite values (.inf, -.inf, .nan): JSON has no
                 // representation for them and silently coercing to null would
                 // corrupt the user's file on the write-back.
-                serde_json::Number::from_f64(f).map(Value::Number).ok_or_else(|| {
-                    NonoError::PackageInstall(
-                        "yaml_merge: non-finite float (.inf/.nan) is not representable \
+                serde_json::Number::from_f64(f)
+                    .map(Value::Number)
+                    .ok_or_else(|| {
+                        NonoError::PackageInstall(
+                            "yaml_merge: non-finite float (.inf/.nan) is not representable \
                          in the JSON value model; use a string instead"
-                            .to_string(),
-                    )
-                })
+                                .to_string(),
+                        )
+                    })
             } else {
                 Err(NonoError::PackageInstall(
                     "yaml_merge: unrepresentable number in YAML".to_string(),
@@ -1223,9 +1225,7 @@ fn json_to_yaml(v: Value) -> yaml::Value {
             }
         }
         Value::String(s) => yaml::Value::String(s),
-        Value::Array(arr) => {
-            yaml::Value::Sequence(arr.into_iter().map(json_to_yaml).collect())
-        }
+        Value::Array(arr) => yaml::Value::Sequence(arr.into_iter().map(json_to_yaml).collect()),
         Value::Object(obj) => {
             let mut map = yaml::Mapping::new();
             for (k, v) in obj {
@@ -2027,7 +2027,10 @@ mod tests {
             let restored: yaml::Value =
                 yaml::from_str(&fs::read_to_string(&target).expect("read")).expect("parse");
             assert_eq!(restored["level"], yaml::Value::String("info".to_string()));
-            assert!(restored.get("plugins").is_none(), "merged keys gone after reverse");
+            assert!(
+                restored.get("plugins").is_none(),
+                "merged keys gone after reverse"
+            );
         });
     }
 
