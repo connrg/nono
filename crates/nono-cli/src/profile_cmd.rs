@@ -134,7 +134,7 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     eprintln!(
         "{} Validate with: nono profile validate {}",
         prefix(),
-        output_path.display()
+        profile_validate_target(&args, &output_path)
     );
     eprintln!(
         "{} For editor autocomplete: nono profile schema -o nono-profile.schema.json",
@@ -142,6 +142,13 @@ fn cmd_init(args: ProfileInitArgs) -> Result<()> {
     );
 
     Ok(())
+}
+
+fn profile_validate_target(args: &ProfileInitArgs, output_path: &Path) -> String {
+    match profile::get_user_profile_path(&args.name) {
+        Ok(default_path) if default_path == output_path => args.name.clone(),
+        _ => output_path.display().to_string(),
+    }
 }
 
 /// Build a skeleton profile JSON value with controlled field ordering.
@@ -720,7 +727,7 @@ pub(crate) fn cmd_list(args: ProfileListArgs) -> Result<()> {
 
     if !pack_entries.is_empty() {
         println!();
-        println!("  {}", theme::fg("Packs:", t.subtext).bold());
+        println!("  {}", theme::fg("Packages:", t.subtext).bold());
         for (name, pack_ref, result) in &pack_entries {
             print_pack_profile_line(name, pack_ref, result, t);
         }
@@ -854,6 +861,16 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
             println!("    {}", theme::fg(g, t.text));
         }
     }
+    if !profile.groups.exclude.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            theme::fg("Excluded security groups:", t.subtext).bold()
+        );
+        for g in &profile.groups.exclude {
+            println!("    {}", theme::fg(g, t.yellow));
+        }
+    }
 
     if !profile.commands.allow.is_empty() {
         println!();
@@ -863,6 +880,16 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
         );
         for cmd in &profile.commands.allow {
             println!("    {}", theme::fg(cmd, t.text));
+        }
+    }
+    if !profile.commands.deny.is_empty() {
+        println!();
+        println!(
+            "  {}",
+            theme::fg("Denied commands (deprecated, startup-only):", t.subtext).bold()
+        );
+        for cmd in &profile.commands.deny {
+            println!("    {}", theme::fg(cmd, t.yellow));
         }
     }
 
@@ -919,43 +946,6 @@ pub(crate) fn cmd_show(args: ProfileShowArgs) -> Result<()> {
                 "    {}: {}",
                 theme::fg("bypass_protection", t.yellow),
                 fs.bypass_protection.join(", ")
-            );
-        }
-    }
-
-    // Groups/commands (canonical additions)
-    let has_group_settings =
-        !profile.groups.include.is_empty() || !profile.groups.exclude.is_empty();
-    let has_cmd_settings = !profile.commands.allow.is_empty() || !profile.commands.deny.is_empty();
-    if has_group_settings || has_cmd_settings {
-        println!();
-        println!("  {}", theme::fg("Policy patches:", t.subtext).bold());
-        if !profile.groups.include.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("groups.include", t.subtext),
-                profile.groups.include.join(", ")
-            );
-        }
-        if !profile.groups.exclude.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("groups.exclude", t.yellow),
-                profile.groups.exclude.join(", ")
-            );
-        }
-        if !profile.commands.allow.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("commands.allow", t.subtext),
-                profile.commands.allow.join(", ")
-            );
-        }
-        if !profile.commands.deny.is_empty() {
-            println!(
-                "    {}: {}",
-                theme::fg("commands.deny (deprecated, startup-only)", t.yellow),
-                profile.commands.deny.join(", ")
             );
         }
     }
@@ -3178,6 +3168,61 @@ mod tests {
         assert!(result.is_err());
         let err = result.expect_err("error");
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn profile_validate_target_prefers_name_for_default_user_profile_path() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let args = ProfileInitArgs {
+            name: "copilot".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: None,
+            force: false,
+        };
+        let output_path = profile::get_user_profile_path("copilot").expect("profile path");
+
+        assert_eq!(profile_validate_target(&args, &output_path), "copilot");
+    }
+
+    #[test]
+    fn profile_validate_target_uses_path_for_custom_output() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let xdg = dir.path().join("config");
+        std::fs::create_dir_all(&xdg).expect("create xdg");
+        let xdg_str = xdg.to_str().expect("utf8 xdg");
+        let _env = crate::test_env::EnvVarGuard::set_all(&[("XDG_CONFIG_HOME", xdg_str)]);
+
+        let output_path = dir.path().join("custom-copilot.json");
+        let args = ProfileInitArgs {
+            name: "copilot".to_string(),
+            extends: None,
+            groups: vec![],
+            description: None,
+            full: false,
+            output: Some(output_path.clone()),
+            force: false,
+        };
+
+        assert_eq!(
+            profile_validate_target(&args, &output_path),
+            output_path.display().to_string()
+        );
     }
 
     #[test]

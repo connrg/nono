@@ -186,6 +186,8 @@ pub fn analyze_error_output(
     let mut observed = std::collections::BTreeMap::<PathBuf, AccessMode>::new();
     let mut missing = std::collections::BTreeSet::<PathBuf>::new();
     let mut pending_relative_write: Option<PathBuf> = None;
+    let mut pending_structured_access_denial = false;
+    let mut pending_structured_access: Option<AccessMode> = None;
     let mut non_sandbox_failure = None;
 
     for line in error_output.lines() {
@@ -201,6 +203,29 @@ pub fn analyze_error_output(
             current_dir.and_then(|cwd| extract_relative_write_path_from_line(line, cwd))
         {
             pending_relative_write = Some(path);
+        }
+
+        if looks_like_structured_access_denial_code(line) {
+            pending_structured_access_denial = true;
+        }
+
+        if pending_structured_access_denial {
+            if let Some(access) = infer_access_from_structured_syscall_line(line) {
+                pending_structured_access = Some(access);
+            }
+
+            if let (Some(path), Some(access)) = (
+                extract_structured_path_property(line),
+                pending_structured_access,
+            ) {
+                observed
+                    .entry(path)
+                    .and_modify(|existing| *existing = merge_access_modes(*existing, access))
+                    .or_insert(access);
+                pending_structured_access_denial = false;
+                pending_structured_access = None;
+                continue;
+            }
         }
 
         if looks_like_missing_path(line) {
@@ -304,6 +329,11 @@ fn looks_like_access_denial(line: &str) -> bool {
         || lower.contains("read-only file system")
 }
 
+fn looks_like_structured_access_denial_code(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    (lower.contains("eperm") || lower.contains("eacces")) && looks_like_access_denial(line)
+}
+
 fn looks_like_missing_path(line: &str) -> bool {
     line.to_ascii_lowercase()
         .contains("no such file or directory")
@@ -344,6 +374,10 @@ fn format_command_succeeded_with_stderr_line() -> String {
 }
 
 fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
+    if let Some(path) = extract_path_after_syscall_word(line) {
+        return Some(path);
+    }
+
     let denial_markers = [
         "Operation not permitted",
         "Permission denied",
@@ -361,7 +395,58 @@ fn extract_denied_path_from_error_line(line: &str) -> Option<PathBuf> {
         }
     }
 
-    extract_path_from_segment(prefix)
+    extract_path_from_segment(prefix).or_else(|| extract_path_from_segment(line))
+}
+
+fn extract_path_after_syscall_word(line: &str) -> Option<PathBuf> {
+    const MARKERS: &[&str] = &["mkdir", "mkdtemp", "open", "copyfile", "rename", "unlink"];
+
+    let lower = line.to_ascii_lowercase();
+    for marker in MARKERS {
+        let needle = format!("{marker} ");
+        let Some(idx) = lower.find(&needle) else {
+            continue;
+        };
+        let segment = line.get(idx + needle.len()..)?;
+        if let Some(path) = extract_path_from_segment(segment) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+fn infer_access_from_structured_syscall_line(line: &str) -> Option<AccessMode> {
+    let syscall = extract_structured_string_property(line, "syscall")?;
+    Some(match syscall.to_ascii_lowercase().as_str() {
+        "mkdir" | "mkdtemp" | "rmdir" | "unlink" | "rename" | "write" | "copyfile" | "chmod"
+        | "chown" | "utimes" => AccessMode::Write,
+        _ => AccessMode::ReadWrite,
+    })
+}
+
+fn extract_structured_path_property(line: &str) -> Option<PathBuf> {
+    extract_structured_string_property(line, "path").map(PathBuf::from)
+}
+
+fn extract_structured_string_property(line: &str, key: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let after_key = trimmed
+        .strip_prefix(key)
+        .or_else(|| trimmed.strip_prefix(&format!("\"{key}\"")))
+        .or_else(|| trimmed.strip_prefix(&format!("'{key}'")))?;
+    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
+    let quote = after_colon.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let after_quote = after_colon.get(quote.len_utf8()..)?;
+    let end = after_quote.find(quote)?;
+    let value = after_quote[..end].trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 fn extract_relative_write_path_from_line(line: &str, current_dir: &Path) -> Option<PathBuf> {
@@ -452,6 +537,10 @@ fn infer_access_from_error_line(line: &str, path: &Path) -> AccessMode {
         || lower.contains("can't create")
         || lower.contains("write error")
         || lower.contains("read-only file system")
+        || lower.contains("operation not permitted, mkdir ")
+        || lower.contains("permission denied, mkdir ")
+        || lower.contains("eperm") && lower.contains("mkdir ")
+        || lower.contains("eacces") && lower.contains("mkdir ")
         || lower.starts_with("tee:")
         || lower.starts_with("touch:")
         || lower.starts_with("mkdir:")
@@ -968,12 +1057,13 @@ impl<'a> DiagnosticFormatter<'a> {
 
         // Merge supervisor denials (Linux seccomp) with violation-derived
         // denials (macOS Seatbelt) into a single unified list.
-        let all_denials: Vec<DenialRecord> = self
+        let mut all_denials: Vec<DenialRecord> = self
             .denials
             .iter()
             .cloned()
             .chain(violation_denials)
             .collect();
+        all_denials.extend(self.observed_denials_matching_logged_paths(&all_denials));
 
         if all_denials.is_empty() {
             // No denials from either source.
@@ -1031,6 +1121,30 @@ impl<'a> DiagnosticFormatter<'a> {
                         path: hint.path.clone(),
                         access,
                     })
+            })
+            .collect()
+    }
+
+    fn observed_denials_matching_logged_paths(
+        &self,
+        denials: &[DenialRecord],
+    ) -> Vec<DenialRecord> {
+        if denials.is_empty() {
+            return Vec::new();
+        }
+
+        let logged_paths = denials
+            .iter()
+            .map(|denial| denial.path.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        self.actionable_observed_path_hints()
+            .into_iter()
+            .filter(|hint| logged_paths.contains(&hint.path))
+            .map(|hint| DenialRecord {
+                path: hint.path,
+                access: hint.access,
+                reason: DenialReason::InsufficientAccess,
             })
             .collect()
     }
@@ -1291,7 +1405,7 @@ impl<'a> DiagnosticFormatter<'a> {
         if let Some(flag) = self
             .policy_explanations
             .iter()
-            .find(|e| e.path == denial.path)
+            .find(|e| e.path == denial.path && e.access == denial.access)
             .and_then(|e| e.suggested_flag.clone())
         {
             // explanations' suggested_flag is of the form "--read /path".
@@ -1724,10 +1838,10 @@ fn format_non_fs_guidance(lines: &mut Vec<String>, violations: &[&SandboxViolati
     if has_guidance(SystemServiceGuidance::UserPreferences) {
         lines.push("[nono] Preference reads use macOS CFPreferences / NSUserDefaults.".to_string());
         lines.push(
-            "[nono] They are platform operations, not filesystem paths, so nono does not save them automatically.".to_string(),
+            "[nono] They are platform operations, not filesystem paths; saving them writes a raw macOS Seatbelt rule.".to_string(),
         );
         lines.push(
-            "[nono] If the tool requires this, add a reviewed user profile rule:".to_string(),
+            "[nono] If the tool requires this, accept the profile prompt or add a reviewed user profile rule:".to_string(),
         );
         lines.push(
             "[nono]   \"unsafe_macos_seatbelt_rules\": [\"(allow user-preference-read)\"]"
@@ -2155,6 +2269,42 @@ mod tests {
             observation.path_hints,
             vec![ObservedPathHint {
                 path: PathBuf::from("/tmp/file with spaces.txt"),
+                access: AccessMode::Write,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_analyze_error_output_detects_node_eperm_mkdir_as_write() {
+        let observation = analyze_error_output(
+            "Failed to extract bundled package: Error: EPERM: operation not permitted, mkdir '/Users/luke/Library/Caches/copilot/pkg/darwin-arm64'\n",
+            &[],
+            None,
+        );
+
+        let hint = ObservedPathHint {
+            path: PathBuf::from("/Users/luke/Library/Caches/copilot/pkg/darwin-arm64"),
+            access: AccessMode::Write,
+        };
+        assert_eq!(observation.path_hints, vec![hint.clone()]);
+        assert_eq!(
+            observation.primary_verdict,
+            Some(ErrorVerdict::LikelySandbox(hint))
+        );
+    }
+
+    #[test]
+    fn test_analyze_error_output_detects_structured_node_eperm_mkdir_path() {
+        let observation = analyze_error_output(
+            "Error: EPERM: operation not permitted\n  code: 'EPERM',\n  syscall: 'mkdir',\n  path: '/Users/luke/Library/Caches/copilot/pkg/darwin-arm64'\n",
+            &[],
+            None,
+        );
+
+        assert_eq!(
+            observation.path_hints,
+            vec![ObservedPathHint {
+                path: PathBuf::from("/Users/luke/Library/Caches/copilot/pkg/darwin-arm64"),
                 access: AccessMode::Write,
             }]
         );
@@ -2727,6 +2877,49 @@ mod tests {
         assert!(output.contains("Also blocked (system services):"));
         assert!(output.contains("mach-lookup (com.apple.logd)"));
         assert!(output.contains("System logging"));
+    }
+
+    #[test]
+    fn test_supervised_merges_mkdir_error_hint_with_logged_read_denial() {
+        let temp = tempdir().expect("tempdir should be created");
+        let pkg = temp.path().join("Library/Caches/copilot/pkg");
+        std::fs::create_dir_all(&pkg).expect("pkg fixture should be created");
+        let denied = pkg.join("darwin-arm64");
+
+        let caps = CapabilitySet::new();
+        let violations = vec![SandboxViolation {
+            operation: "file-read-data".to_string(),
+            target: Some(denied.display().to_string()),
+        }];
+        let formatter = DiagnosticFormatter::new(&caps)
+            .with_mode(DiagnosticMode::Supervised)
+            .with_sandbox_violations(&violations)
+            .with_error_observation(ErrorObservation {
+                primary_verdict: Some(ErrorVerdict::LikelySandbox(ObservedPathHint {
+                    path: denied.clone(),
+                    access: AccessMode::Write,
+                })),
+                blocked_protected_file: None,
+                path_hints: vec![ObservedPathHint {
+                    path: denied.clone(),
+                    access: AccessMode::Write,
+                }],
+                missing_paths: Vec::new(),
+                non_sandbox_failure: None,
+            })
+            .with_policy_explanations(vec![PolicyExplanation {
+                path: denied.clone(),
+                access: AccessMode::Read,
+                reason: "path_not_granted".to_string(),
+                details: None,
+                policy_source: None,
+                suggested_flag: Some(format!("--read {}", denied.display())),
+            }]);
+        let output = formatter.format_footer(1);
+
+        assert!(output.contains(&format!("{} (read+write)", denied.display())));
+        assert!(output.contains(&format!("Fix: --allow {}", pkg.display())));
+        assert!(!output.contains(&format!("Fix: --read {}", denied.display())));
     }
 
     #[test]

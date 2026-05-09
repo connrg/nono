@@ -14,6 +14,7 @@ use crate::{
 use colored::Colorize;
 use nono::undo::ExecutableIdentity;
 use nono::{CapabilitySet, Result};
+use std::io::IsTerminal;
 use std::sync::Mutex;
 
 struct SessionRuntimeState {
@@ -119,7 +120,12 @@ fn create_session_runtime_state(
         rollback_session: audit_state.map(|state| state.session_id.clone()),
     };
     let session_guard = Some(session::SessionGuard::new(session_record)?);
-    let pty_pair = if session.detached_start {
+    let pty_pair = if should_open_supervised_pty(
+        session.detached_start,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
         Some(pty_proxy::open_pty()?)
     } else {
         None
@@ -131,6 +137,15 @@ fn create_session_runtime_state(
         session_guard,
         pty_pair,
     })
+}
+
+fn should_open_supervised_pty(
+    detached_start: bool,
+    stdin_is_terminal: bool,
+    stdout_is_terminal: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    detached_start || (stdin_is_terminal && stdout_is_terminal && stderr_is_terminal)
 }
 
 pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> Result<i32> {
@@ -257,4 +272,22 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     })?;
 
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_open_supervised_pty;
+
+    #[test]
+    fn supervised_pty_is_used_for_attached_terminals() {
+        assert!(should_open_supervised_pty(false, true, true, true));
+        assert!(!should_open_supervised_pty(false, false, true, true));
+        assert!(!should_open_supervised_pty(false, true, false, true));
+        assert!(!should_open_supervised_pty(false, true, true, false));
+    }
+
+    #[test]
+    fn supervised_pty_is_always_used_for_detached_start() {
+        assert!(should_open_supervised_pty(true, false, false, false));
+    }
 }

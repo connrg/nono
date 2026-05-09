@@ -69,6 +69,9 @@ const MAX_CRYPTO_THREADS: usize = 7;
 const MAX_DENIAL_RECORDS: usize = 1000;
 /// Hard cap on request IDs tracked for replay detection.
 const MAX_TRACKED_REQUEST_IDS: usize = 4096;
+/// Quiet period used to drain final PTY output after child exit before parent
+/// diagnostics/prompts take over the terminal.
+const POST_EXIT_PTY_DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 
 fn offer_profile_save_for_child(
     pty: Option<&mut crate::pty_proxy::PtyProxy>,
@@ -77,6 +80,7 @@ fn offer_profile_save_for_child(
     caps: &CapabilitySet,
     command: &[String],
     compared_profile: Option<&str>,
+    sandbox_violations: &[nono::SandboxViolation],
 ) -> Result<()> {
     if let Some(proxy) = pty {
         let _released_terminal = proxy.release_terminal_for_prompt();
@@ -86,6 +90,7 @@ fn offer_profile_save_for_child(
             caps,
             command,
             compared_profile,
+            sandbox_violations,
         );
     }
 
@@ -95,6 +100,7 @@ fn offer_profile_save_for_child(
         caps,
         command,
         compared_profile,
+        sandbox_violations,
     )
 }
 
@@ -368,8 +374,9 @@ pub fn execute_direct(config: &ExecConfig<'_>) -> Result<()> {
 /// 4. Child: apply Landlock, install seccomp-notify, close inherited FDs, exec
 /// 5. Parent: apply PR_SET_DUMPABLE(0) + PT_DENY_ATTACH, receive seccomp fd, run supervisor loop
 ///
-/// Does NOT pipe stdout/stderr. The child inherits the parent's terminal directly,
-/// preserving TTY semantics for interactive programs (e.g., Claude Code, vim).
+/// When a PTY pair is provided, the child runs behind the PTY proxy so the
+/// parent can capture terminal output for diagnostics while the child still sees
+/// a TTY. Otherwise the child inherits the parent's terminal directly.
 /// The parent prints diagnostics and rollback UI after the child exits.
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
@@ -1119,7 +1126,9 @@ pub fn execute_supervised(
             // attaching client gets EPIPE ("Broken pipe") when it
             // tries to send the handshake.
             if let Some(ref mut p) = pty_proxy {
+                p.drain_master_output(POST_EXIT_PTY_DRAIN_TIMEOUT);
                 p.shutdown_attach_listener();
+                p.release_terminal_for_prompt();
             }
 
             let exit_code = match status {
@@ -1229,6 +1238,7 @@ pub fn execute_supervised(
                 exit_code,
                 &prompt_policy_explanations,
                 &prompt_error_observation,
+                &sandbox_violations,
             ) {
                 // Clear the forwarding target before prompting. The child is
                 // already dead; keeping CHILD_PID set would cause forward_signal
@@ -1241,6 +1251,7 @@ pub fn execute_supervised(
                     config.caps,
                     config.command,
                     config.profile_save_base,
+                    &sandbox_violations,
                 )?;
             }
 
@@ -1384,11 +1395,13 @@ fn should_offer_profile_save(
     exit_code: i32,
     policy_explanations: &[nono::diagnostic::PolicyExplanation],
     error_observation: &nono::diagnostic::ErrorObservation,
+    sandbox_violations: &[nono::SandboxViolation],
 ) -> bool {
     !no_diagnostics
         && (exit_code != 0
             || !policy_explanations.is_empty()
-            || !error_observation.path_hints.is_empty())
+            || !error_observation.path_hints.is_empty()
+            || crate::profile_save_runtime::has_saveable_system_service_rules(sandbox_violations))
 }
 
 /// Close inherited file descriptors, keeping stdin/stdout/stderr and specified FDs.
@@ -1754,7 +1767,9 @@ fn handle_pty_poll_events(
     resize_revents: libc::c_short,
     loop_name: &str,
 ) -> bool {
-    if master_revents & libc::POLLIN != 0 && !pty.proxy_master_to_client() {
+    if master_revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        && !pty.proxy_master_to_client()
+    {
         debug!("Stopping {loop_name} after PTY master relay failure");
         return false;
     }
@@ -3325,6 +3340,25 @@ mod tests {
             0,
             &explanations,
             &observation,
+            &[],
+        ));
+    }
+
+    #[test]
+    fn test_profile_save_prompt_triggers_on_user_preferences_violation_with_zero_exit() {
+        let explanations = Vec::new();
+        let observation = nono::diagnostic::ErrorObservation::default();
+        let violations = vec![nono::SandboxViolation {
+            operation: "user-preference-read".to_string(),
+            target: Some("kcfpreferencesanyapplication".to_string()),
+        }];
+
+        assert!(should_offer_profile_save(
+            false,
+            0,
+            &explanations,
+            &observation,
+            &violations,
         ));
     }
 
@@ -3365,12 +3399,14 @@ mod tests {
             1,
             &explanations,
             &observation,
+            &[],
         ));
         assert!(!should_offer_profile_save(
             true,
             1,
             &explanations,
             &observation,
+            &[],
         ));
     }
 

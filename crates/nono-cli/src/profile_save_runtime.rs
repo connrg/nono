@@ -2,6 +2,7 @@ use crate::command_display::format_command_line;
 use crate::{profile, query_ext};
 use colored::Colorize;
 use nono::diagnostic::{ErrorObservation, PolicyExplanation};
+use nono::SandboxViolation;
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
@@ -33,6 +34,7 @@ struct PatchGrant {
 /// return true) but no human to answer. Mirrors the `NONO_NO_MIGRATE`
 /// escape hatch on the migration prompt.
 const ENV_NO_SAVE_PROMPT: &str = "NONO_NO_SAVE_PROMPT";
+const USER_PREFERENCES_SEATBELT_RULE: &str = "(allow user-preference-read)";
 
 pub(crate) fn terminal_prompts_available() -> bool {
     if matches!(
@@ -52,17 +54,25 @@ pub(crate) fn offer_save_run_profile(
     caps: &CapabilitySet,
     command: &[String],
     compared_profile: Option<&str>,
+    sandbox_violations: &[SandboxViolation],
 ) -> Result<()> {
-    if compared_profile.is_none() || !terminal_prompts_available() {
+    if !terminal_prompts_available() {
         return Ok(());
     }
 
-    let Some(patch) = build_run_profile_patch(policy_explanations, error_observation, caps)? else {
+    let Some(patch) = build_run_profile_patch(
+        policy_explanations,
+        error_observation,
+        caps,
+        sandbox_violations,
+    )?
+    else {
         return Ok(());
     };
 
     let cmd_name = command_name(command)?;
     let has_overrides = patch_has_policy_overrides(&patch);
+    let _prompt_terminal = prepare_prompt_terminal();
 
     prompt_println("");
     print_patch_preview(&patch);
@@ -73,7 +83,7 @@ pub(crate) fn offer_save_run_profile(
         let confirmed = if has_overrides {
             confirm_typed_word(
                 &format!(
-                    "Update existing user profile '{}' with these paths, including policy overrides? Type 'override' to confirm: ",
+                    "Update existing user profile '{}' with these entries, including unsafe policy overrides? Type 'override' to confirm: ",
                     existing_profile
                 ),
                 "override",
@@ -81,7 +91,7 @@ pub(crate) fn offer_save_run_profile(
         } else {
             confirm(
                 &format!(
-                    "Update existing user profile '{}' with denied paths? [Y/n] ",
+                    "Update existing user profile '{}' with denied paths/rules? [Y/n] ",
                     existing_profile
                 ),
                 true,
@@ -101,7 +111,7 @@ pub(crate) fn offer_save_run_profile(
         return Ok(());
     }
 
-    let suggested = suggested_profile_name(compared_profile);
+    let suggested = suggested_run_profile_name(compared_profile, &cmd_name);
     let Some(profile_name) = prompt_profile_name(suggested.as_deref())? else {
         return Ok(());
     };
@@ -217,6 +227,56 @@ pub(crate) fn suggested_profile_name(compared_profile: Option<&str>) -> Option<S
         .map(|name| format!("{}-local", name))
 }
 
+fn suggested_run_profile_name(compared_profile: Option<&str>, cmd_name: &str) -> Option<String> {
+    if let Some(name) = suggested_profile_name(compared_profile) {
+        return Some(name);
+    }
+
+    let candidate = profile_name_from_command(cmd_name)?;
+    if would_shadow_builtin(&candidate) {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+fn profile_name_from_command(cmd_name: &str) -> Option<String> {
+    let mut out = String::with_capacity(cmd_name.len());
+    let mut last_was_hyphen = false;
+
+    for ch in cmd_name.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else if ch == '-' || ch == '_' || ch == '.' {
+            Some('-')
+        } else {
+            None
+        };
+
+        if let Some(ch) = mapped {
+            if ch == '-' {
+                if out.is_empty() || last_was_hyphen {
+                    continue;
+                }
+                last_was_hyphen = true;
+            } else {
+                last_was_hyphen = false;
+            }
+            out.push(ch);
+        }
+    }
+
+    while out.ends_with('-') {
+        out.pop();
+    }
+
+    if profile::is_valid_profile_name(&out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
 /// Return true when writing `~/.config/nono/profiles/<name>.json` would shadow
 /// a built-in profile of the same name. User files are loaded in preference to
 /// built-ins, so saving under a built-in's name silently reroutes all future
@@ -325,9 +385,21 @@ pub(crate) fn print_profile_save(prepared: &PreparedProfileSave, command: &[Stri
         prompt_println(&format!(
             "{}",
             format!(
-                "  ({} path{} with filesystem.bypass_protection — review the profile before sharing)",
+                "  ({} path{} with filesystem.bypass_protection - review the profile before sharing)",
                 override_count,
                 if override_count == 1 { "" } else { "s" }
+            )
+            .yellow()
+        ));
+    }
+    let unsafe_rule_count = prepared.profile.unsafe_macos_seatbelt_rules.len();
+    if unsafe_rule_count > 0 {
+        prompt_println(&format!(
+            "{}",
+            format!(
+                "  ({} raw macOS Seatbelt rule{} via unsafe_macos_seatbelt_rules - review the profile before sharing)",
+                unsafe_rule_count,
+                if unsafe_rule_count == 1 { "" } else { "s" }
             )
             .yellow()
         ));
@@ -356,19 +428,36 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
     ];
 
     let has_entries = sections.iter().any(|(_, paths)| !paths.is_empty());
-    if !has_entries && patch.filesystem.bypass_protection.is_empty() {
+    let has_unsafe_rules = !patch.unsafe_macos_seatbelt_rules.is_empty();
+    if !has_entries && patch.filesystem.bypass_protection.is_empty() && !has_unsafe_rules {
         return;
     }
 
-    prompt_println("[nono] Paths to be saved:");
-    for (label, paths) in sections {
-        for path in *paths {
-            let is_override = patch.filesystem.bypass_protection.contains(path);
-            if is_override {
-                prompt_println(&format!("  {}  {} ({})", "⚠".red(), path, label));
-            } else {
-                prompt_println(&format!("  {}  ({})", path, label));
+    if has_entries {
+        prompt_println("[nono] Paths to be saved:");
+        for (label, paths) in sections {
+            for path in *paths {
+                let is_override = patch.filesystem.bypass_protection.contains(path);
+                if is_override {
+                    prompt_println(&format!("  {}  {} ({})", "⚠".red(), path, label));
+                } else {
+                    prompt_println(&format!("  {}  ({})", path, label));
+                }
             }
+        }
+    }
+
+    if has_unsafe_rules {
+        if has_entries {
+            prompt_println("");
+        }
+        prompt_println("[nono] Unsafe macOS Seatbelt rules to be saved:");
+        for rule in &patch.unsafe_macos_seatbelt_rules {
+            prompt_println(&format!(
+                "  {}  {}  (unsafe_macos_seatbelt_rules)",
+                "⚠".red(),
+                rule
+            ));
         }
     }
 
@@ -383,11 +472,23 @@ pub(crate) fn print_patch_preview(patch: &profile::Profile) {
                 .red()
         ));
     }
+
+    if has_unsafe_rules {
+        prompt_println(&format!(
+            "{}",
+            "\n[nono] ⚠  The marked rules are raw macOS Seatbelt policy.".red()
+        ));
+        prompt_println(&format!(
+            "{}",
+            "[nono]    Saving them adds unsafe_macos_seatbelt_rules, which bypasses nono's capability model and can weaken sandbox protection."
+                .red()
+        ));
+    }
 }
 
-/// Return true if the patch includes any `filesystem.bypass_protection` entries.
+/// Return true if the patch includes entries that bypass normal capability policy.
 pub(crate) fn patch_has_policy_overrides(patch: &profile::Profile) -> bool {
-    !patch.filesystem.bypass_protection.is_empty()
+    !patch.filesystem.bypass_protection.is_empty() || !patch.unsafe_macos_seatbelt_rules.is_empty()
 }
 
 fn prompt_print(template: &str, args: &[&str]) {
@@ -485,6 +586,12 @@ impl Drop for PromptTerminalGuard {
     }
 }
 
+fn prepare_prompt_terminal() -> Option<PromptTerminalGuard> {
+    open_tty_prompt_device()
+        .ok()
+        .map(|tty| PromptTerminalGuard::new(&tty))
+}
+
 pub(crate) fn configure_prompt_termios(termios: &mut nix::sys::termios::Termios) {
     use nix::sys::termios::{
         ControlFlags, InputFlags, LocalFlags, OutputFlags, SpecialCharacterIndices,
@@ -523,7 +630,7 @@ pub(crate) fn configure_prompt_termios(termios: &mut nix::sys::termios::Termios)
 
 fn prompt_write(message: &str) {
     if let Some(mut tty) = open_tty_writer() {
-        let _ = write!(tty, "{}", message);
+        let _ = write!(tty, "{}", prompt_inline_for_tty(message));
         let _ = tty.flush();
         return;
     }
@@ -534,13 +641,25 @@ fn prompt_write(message: &str) {
 
 fn prompt_writeln(message: &str) {
     if let Some(mut tty) = open_tty_writer() {
-        let _ = writeln!(tty, "{}", message);
+        let _ = write!(tty, "{}", prompt_line_for_tty(message));
         let _ = tty.flush();
         return;
     }
 
-    eprintln!("{}", message);
+    eprint!("{}", prompt_line(message));
     let _ = std::io::stderr().flush();
+}
+
+fn prompt_line(message: &str) -> String {
+    format!("{message}\r\n")
+}
+
+fn prompt_inline_for_tty(message: &str) -> String {
+    format!("\r{message}\x1b[K")
+}
+
+fn prompt_line_for_tty(message: &str) -> String {
+    format!("\r{message}\x1b[K\r\n")
 }
 
 pub(crate) fn prepare_profile_save_from_patch(
@@ -596,6 +715,7 @@ fn build_run_profile_patch(
     policy_explanations: &[PolicyExplanation],
     error_observation: &ErrorObservation,
     caps: &CapabilitySet,
+    sandbox_violations: &[SandboxViolation],
 ) -> Result<Option<profile::Profile>> {
     let mut grants: BTreeMap<PathBuf, PatchGrant> = BTreeMap::new();
 
@@ -622,12 +742,12 @@ fn build_run_profile_patch(
         }
     }
 
-    if grants.is_empty() {
+    let unsafe_rules = unsafe_seatbelt_rules_from_sandbox_violations(sandbox_violations);
+
+    if grants.is_empty() && unsafe_rules.is_empty() {
         return Ok(None);
     }
 
-    let home = crate::config::validated_home()?;
-    let home_path = Path::new(&home);
     let mut allow = BTreeSet::new();
     let mut read = BTreeSet::new();
     let mut write = BTreeSet::new();
@@ -636,30 +756,35 @@ fn build_run_profile_patch(
     let mut write_file = BTreeSet::new();
     let mut bypass_protection = BTreeSet::new();
 
-    for (path, grant) in grants {
-        let shortened = shorten_path_for_profile(&path, home_path);
-        if grant.bypass_protection {
-            bypass_protection.insert(shortened.clone());
-        }
+    if !grants.is_empty() {
+        let home = crate::config::validated_home()?;
+        let home_path = Path::new(&home);
 
-        match (grant.access, grant.is_file) {
-            (AccessMode::Read, false) => {
-                read.insert(shortened);
+        for (path, grant) in grants {
+            let shortened = shorten_path_for_profile(&path, home_path);
+            if grant.bypass_protection {
+                bypass_protection.insert(shortened.clone());
             }
-            (AccessMode::Write, false) => {
-                write.insert(shortened);
-            }
-            (AccessMode::ReadWrite, false) => {
-                allow.insert(shortened);
-            }
-            (AccessMode::Read, true) => {
-                read_file.insert(shortened);
-            }
-            (AccessMode::Write, true) => {
-                write_file.insert(shortened);
-            }
-            (AccessMode::ReadWrite, true) => {
-                allow_file.insert(shortened);
+
+            match (grant.access, grant.is_file) {
+                (AccessMode::Read, false) => {
+                    read.insert(shortened);
+                }
+                (AccessMode::Write, false) => {
+                    write.insert(shortened);
+                }
+                (AccessMode::ReadWrite, false) => {
+                    allow.insert(shortened);
+                }
+                (AccessMode::Read, true) => {
+                    read_file.insert(shortened);
+                }
+                (AccessMode::Write, true) => {
+                    write_file.insert(shortened);
+                }
+                (AccessMode::ReadWrite, true) => {
+                    allow_file.insert(shortened);
+                }
             }
         }
     }
@@ -672,8 +797,33 @@ fn build_run_profile_patch(
     patch.filesystem.read_file = read_file.into_iter().collect();
     patch.filesystem.write_file = write_file.into_iter().collect();
     patch.filesystem.bypass_protection = bypass_protection.into_iter().collect();
+    patch.unsafe_macos_seatbelt_rules = unsafe_rules.into_iter().collect();
 
     Ok(Some(patch))
+}
+
+pub(crate) fn has_saveable_system_service_rules(violations: &[SandboxViolation]) -> bool {
+    violations
+        .iter()
+        .any(is_user_preference_read_sandbox_violation)
+}
+
+fn unsafe_seatbelt_rules_from_sandbox_violations(
+    violations: &[SandboxViolation],
+) -> BTreeSet<String> {
+    let mut rules = BTreeSet::new();
+    if has_saveable_system_service_rules(violations) {
+        rules.insert(USER_PREFERENCES_SEATBELT_RULE.to_string());
+    }
+    rules
+}
+
+fn is_user_preference_read_sandbox_violation(violation: &SandboxViolation) -> bool {
+    violation.operation == "user-preference-read"
+        && violation
+            .target
+            .as_deref()
+            .is_some_and(|target| target.starts_with("kcfpreferences"))
 }
 
 fn add_patch_grant(
@@ -729,6 +879,10 @@ pub(crate) fn merge_profile_patch(profile: &mut profile::Profile, patch: &profil
         &profile.filesystem.bypass_protection,
         &patch.filesystem.bypass_protection,
     );
+    profile.unsafe_macos_seatbelt_rules = profile::dedup_append(
+        &profile.unsafe_macos_seatbelt_rules,
+        &patch.unsafe_macos_seatbelt_rules,
+    );
 }
 
 pub(crate) fn shorten_path_for_profile(path: &Path, home_path: &Path) -> String {
@@ -771,6 +925,7 @@ mod tests {
             &[explanation],
             &ErrorObservation::default(),
             &CapabilitySet::new(),
+            &[],
         )
         .expect("build patch")
         .expect("patch");
@@ -812,6 +967,7 @@ mod tests {
             &[read, write],
             &ErrorObservation::default(),
             &CapabilitySet::new(),
+            &[],
         )
         .expect("build patch")
         .expect("patch");
@@ -819,6 +975,120 @@ mod tests {
         assert_eq!(patch.filesystem.allow_file, vec!["~/config.json"]);
         assert!(patch.filesystem.read_file.is_empty());
         assert!(patch.filesystem.write_file.is_empty());
+    }
+
+    #[test]
+    fn build_run_profile_patch_adds_unsafe_rule_for_user_preferences_violation() {
+        let violations = vec![SandboxViolation {
+            operation: "user-preference-read".to_string(),
+            target: Some("kcfpreferencesanyapplication".to_string()),
+        }];
+
+        let patch = build_run_profile_patch(
+            &[],
+            &ErrorObservation::default(),
+            &CapabilitySet::new(),
+            &violations,
+        )
+        .expect("build patch")
+        .expect("patch");
+
+        assert_eq!(
+            patch.unsafe_macos_seatbelt_rules,
+            vec![USER_PREFERENCES_SEATBELT_RULE.to_string()]
+        );
+        assert!(patch.filesystem.allow.is_empty());
+        assert!(patch.filesystem.read.is_empty());
+        assert!(patch.filesystem.write.is_empty());
+    }
+
+    #[test]
+    fn unsafe_macos_seatbelt_rules_count_as_policy_overrides() {
+        let mut patch = profile::Profile::default();
+        assert!(!patch_has_policy_overrides(&patch));
+
+        patch.unsafe_macos_seatbelt_rules = vec![USER_PREFERENCES_SEATBELT_RULE.to_string()];
+
+        assert!(patch_has_policy_overrides(&patch));
+    }
+
+    #[test]
+    fn suggested_run_profile_name_uses_compared_profile_when_available() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        assert_eq!(
+            suggested_run_profile_name(Some("claude-code"), "copilot"),
+            Some("claude-code-local".to_string())
+        );
+    }
+
+    #[test]
+    fn suggested_run_profile_name_falls_back_to_command_name() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        assert_eq!(
+            suggested_run_profile_name(None, "copilot"),
+            Some("copilot".to_string())
+        );
+        assert_eq!(
+            suggested_run_profile_name(None, "GitHub.Copilot"),
+            Some("github-copilot".to_string())
+        );
+    }
+
+    #[test]
+    fn suggested_run_profile_name_avoids_shadowing_builtin() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        assert_eq!(suggested_run_profile_name(None, "opencode"), None);
+    }
+
+    #[test]
+    fn prompt_line_uses_crlf_for_terminal_layout() {
+        assert_eq!(
+            prompt_line("[nono] Paths to be saved:"),
+            "[nono] Paths to be saved:\r\n"
+        );
+        assert_eq!(prompt_line(""), "\r\n");
+    }
+
+    #[test]
+    fn prompt_tty_rendering_clears_line_tails() {
+        assert_eq!(
+            prompt_line_for_tty("[nono] Paths to be saved:"),
+            "\r[nono] Paths to be saved:\u{1b}[K\r\n"
+        );
+        assert_eq!(
+            prompt_inline_for_tty("Update profile? [Y/n] "),
+            "\rUpdate profile? [Y/n] \u{1b}[K"
+        );
     }
 
     #[test]
@@ -846,6 +1116,7 @@ mod tests {
         let mut patch = profile::Profile::default();
         patch.filesystem.read_file = vec!["~/.claude/settings.json".to_string()];
         patch.filesystem.bypass_protection = vec!["~/.claude/settings.json".to_string()];
+        patch.unsafe_macos_seatbelt_rules = vec![USER_PREFERENCES_SEATBELT_RULE.to_string()];
 
         let prepared = prepare_profile_save_from_patch(
             &patch,
@@ -869,6 +1140,10 @@ mod tests {
                 "~/old.json".to_string(),
                 "~/.claude/settings.json".to_string()
             ]
+        );
+        assert_eq!(
+            prepared.profile.unsafe_macos_seatbelt_rules,
+            vec![USER_PREFERENCES_SEATBELT_RULE.to_string()]
         );
     }
 

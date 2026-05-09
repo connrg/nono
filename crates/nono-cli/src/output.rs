@@ -404,11 +404,11 @@ fn render_diagnostic_footer(footer: &str) -> String {
 fn print_terminal_block(message: &str, leading_blank_line: bool) {
     let mut stderr = std::io::stderr();
     if stderr.is_terminal() {
-        let normalized = normalize_terminal_line_endings(message);
         if leading_blank_line {
-            let _ = write!(stderr, "\r\n");
+            let _ = write!(stderr, "\r\x1b[K\r\n");
         }
-        let _ = write!(stderr, "\r{}\r\n", normalized);
+        let _ = write!(stderr, "{}", render_terminal_block_for_tty(message));
+        let _ = stderr.flush();
     } else {
         if leading_blank_line {
             let _ = writeln!(stderr);
@@ -417,8 +417,14 @@ fn print_terminal_block(message: &str, leading_blank_line: bool) {
     }
 }
 
-fn normalize_terminal_line_endings(message: &str) -> String {
-    message.replace('\n', "\r\n")
+fn render_terminal_block_for_tty(message: &str) -> String {
+    let mut out = String::new();
+    for line in message.lines() {
+        out.push('\r');
+        out.push_str(line);
+        out.push_str("\x1b[K\r\n");
+    }
+    out
 }
 
 fn render_diagnostic_line(idx: usize, line: &str, t: &theme::Theme) -> String {
@@ -763,25 +769,25 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_unix_socket_mode_badge, normalize_terminal_line_endings, print_capabilities,
-        print_profile_hint, render_diagnostic_footer,
+        format_unix_socket_mode_badge, print_capabilities, print_profile_hint,
+        render_diagnostic_footer, render_terminal_block_for_tty,
     };
     use nono::{CapabilitySet, UnixSocketMode};
     use tempfile::tempdir;
-
-    #[test]
-    fn normalize_terminal_line_endings_uses_crlf() {
-        assert_eq!(
-            normalize_terminal_line_endings("line one\nline two"),
-            "line one\r\nline two"
-        );
-    }
 
     #[test]
     fn render_diagnostic_footer_preserves_line_structure() {
         let footer = "nono diagnostic\n────────\nThe command failed.\n  Learn: nono learn";
         let rendered = render_diagnostic_footer(footer);
         assert_eq!(rendered.lines().count(), 4);
+    }
+
+    #[test]
+    fn render_terminal_block_for_tty_clears_each_line_tail() {
+        assert_eq!(
+            render_terminal_block_for_tty("short\nnext"),
+            "\rshort\u{1b}[K\r\n\rnext\u{1b}[K\r\n"
+        );
     }
 
     #[test]

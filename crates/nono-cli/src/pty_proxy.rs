@@ -25,7 +25,7 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 #[cfg(unix)]
@@ -48,6 +48,7 @@ const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] =
 const TERMINAL_RESTORE_ESCAPE: &[u8] = b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h";
 const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] =
     b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H";
+const CLEAR_PARENT_OUTPUT_AREA: &[u8] = b"\r\x1b[K\x1b[J";
 
 static ATTACH_RESIZE_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
 static ATTACH_RESIZE_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
@@ -71,6 +72,12 @@ enum AttachedClient {
 enum ReadFdOutcome {
     Data(usize),
     Eof,
+    Retry,
+}
+
+enum MasterProxyOutcome {
+    Data,
+    Closed,
     Retry,
 }
 
@@ -348,6 +355,7 @@ impl PtyProxy {
 
         leave_attach_screen();
         self.restore_terminal();
+        prepare_parent_output_area();
         self.client = None;
         self.resize_notifier = None;
         self.pending_detach_match_len = 0;
@@ -539,6 +547,13 @@ impl PtyProxy {
     /// Returns false if the PTY master became unavailable.
     #[must_use = "false indicates the PTY master is no longer usable"]
     pub fn proxy_master_to_client(&mut self) -> bool {
+        !matches!(
+            self.proxy_master_to_client_once(),
+            MasterProxyOutcome::Closed
+        )
+    }
+
+    fn proxy_master_to_client_once(&mut self) -> MasterProxyOutcome {
         let client = self
             .client
             .as_ref()
@@ -547,11 +562,11 @@ impl PtyProxy {
         let mut buf = [0u8; 4096];
         let n = match read_fd_once(self.master.as_raw_fd(), &mut buf) {
             Ok(ReadFdOutcome::Data(n)) => n,
-            Ok(ReadFdOutcome::Eof) => return false,
-            Ok(ReadFdOutcome::Retry) => return true,
+            Ok(ReadFdOutcome::Eof) => return MasterProxyOutcome::Closed,
+            Ok(ReadFdOutcome::Retry) => return MasterProxyOutcome::Retry,
             Err(err) => {
                 debug!("PTY proxy: failed reading PTY master: {}", err);
-                return false;
+                return MasterProxyOutcome::Closed;
             }
         };
 
@@ -565,16 +580,69 @@ impl PtyProxy {
                         self.session_id, err
                     );
                     self.detach();
-                    return true;
+                    return MasterProxyOutcome::Data;
                 } else {
                     debug!("PTY proxy: attached socket client disconnected: {}", err);
                     self.detach();
-                    return true;
+                    return MasterProxyOutcome::Data;
                 }
             }
         }
 
-        true
+        MasterProxyOutcome::Data
+    }
+
+    /// Drain child output still queued on the PTY master after the child exits.
+    ///
+    /// `waitpid` can report the child exit before the supervisor has relayed the
+    /// final terminal bytes. Draining here keeps parent-owned diagnostics and
+    /// prompts ordered after the application's own stderr/stdout.
+    pub fn drain_master_output(&mut self, quiet_timeout: Duration) {
+        let mut quiet_deadline = Instant::now() + quiet_timeout;
+
+        loop {
+            let now = Instant::now();
+            if now >= quiet_deadline {
+                break;
+            }
+            let remaining = quiet_deadline.saturating_duration_since(now);
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            let mut pfd = libc::pollfd {
+                fd: self.master.as_raw_fd(),
+                events: libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+                revents: 0,
+            };
+
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if ret > 0 {
+                if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+                    match self.proxy_master_to_client_once() {
+                        MasterProxyOutcome::Data => {
+                            quiet_deadline = Instant::now() + quiet_timeout;
+                            continue;
+                        }
+                        MasterProxyOutcome::Retry => {
+                            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                                break;
+                            }
+                            continue;
+                        }
+                        MasterProxyOutcome::Closed => break,
+                    }
+                }
+                if pfd.revents & libc::POLLNVAL != 0 {
+                    break;
+                }
+            } else if ret == 0 {
+                break;
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::Interrupted {
+                    debug!("PTY proxy: post-exit drain poll failed: {}", err);
+                    break;
+                }
+            }
+        }
     }
 
     /// Proxy data from the attached client to the PTY master (user → child).
@@ -810,12 +878,25 @@ impl PtyProxy {
         self.screen.render()
     }
 
-    /// Return the current screen content as plain text for diagnostic analysis.
+    /// Return captured terminal output as plain text for diagnostic analysis.
     ///
     /// Called after the child exits so the supervisor can search for
     /// sandbox-related error messages in the terminal output.
     pub fn screen_plaintext(&self) -> String {
-        self.screen.render_plaintext()
+        let mut captured = Vec::with_capacity(self.scrollback.len());
+        captured.extend(self.scrollback.iter().copied());
+        let scrollback = String::from_utf8_lossy(&captured).into_owned();
+        let screen = self.screen.render_plaintext();
+
+        if scrollback.trim().is_empty() {
+            return screen;
+        }
+
+        if screen.trim().is_empty() || scrollback.contains(screen.trim_end()) {
+            return scrollback;
+        }
+
+        format!("{scrollback}\n{screen}")
     }
 
     /// Returns true once the child has rendered visible terminal content.
@@ -1518,6 +1599,12 @@ fn recv_attach_resize_socket(stream: &UnixStream) -> Result<Option<UnixDatagram>
 fn leave_attach_screen() {
     let esc = terminal_restore_escape(false);
     let _ = write_all_fd(libc::STDOUT_FILENO, esc);
+    drain_terminal_output(libc::STDOUT_FILENO);
+}
+
+fn prepare_parent_output_area() {
+    let _ = write_all_fd(libc::STDOUT_FILENO, CLEAR_PARENT_OUTPUT_AREA);
+    drain_terminal_output(libc::STDOUT_FILENO);
 }
 
 pub(crate) fn write_detach_terminal_reset(fd: RawFd) {
@@ -1539,6 +1626,26 @@ pub(crate) fn terminal_restore_escape(clear_screen: bool) -> &'static [u8] {
         TERMINAL_RESTORE_AND_CLEAR_ESCAPE
     } else {
         TERMINAL_RESTORE_ESCAPE
+    }
+}
+
+fn drain_terminal_output(fd: RawFd) {
+    // SAFETY: `isatty` only inspects the borrowed fd and does not take ownership.
+    if unsafe { libc::isatty(fd) } != 1 {
+        return;
+    }
+
+    loop {
+        // SAFETY: `tcdrain` waits for queued terminal output on the borrowed fd.
+        let ret = unsafe { libc::tcdrain(fd) };
+        if ret == 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            debug!("PTY proxy: terminal output drain failed: {}", err);
+            break;
+        }
     }
 }
 
@@ -2277,6 +2384,33 @@ mod tests {
     fn terminal_restore_escape_can_clear_screen() {
         let esc = std::str::from_utf8(terminal_restore_escape(true)).unwrap_or("");
         assert!(esc.ends_with("\u{1b}[2J\u{1b}[H"));
+    }
+
+    #[test]
+    fn screen_plaintext_includes_raw_scrollback_for_diagnostics() {
+        let mut proxy = build_test_proxy(&DEFAULT_DETACH_SEQUENCE);
+        proxy.record_output(
+            b"Failed to extract bundled package: Error: EPERM: operation not permitted, mkdir '/tmp/copilot/pkg/darwin-arm64'\r\n",
+        );
+
+        let text = proxy.screen_plaintext();
+        assert!(text.contains("EPERM: operation not permitted"));
+        assert!(text.contains("mkdir '/tmp/copilot/pkg/darwin-arm64'"));
+    }
+
+    #[test]
+    fn drain_master_output_captures_tail_before_parent_prompt() {
+        let (master_reader, mut master_writer) = UnixStream::pair().expect("socket pair");
+        master_writer
+            .write_all(b"final child stderr line\r\n")
+            .expect("write PTY output");
+        drop(master_writer);
+        let master = unsafe { OwnedFd::from_raw_fd(master_reader.into_raw_fd()) };
+        let mut proxy = build_test_proxy_with_master(master, &DEFAULT_DETACH_SEQUENCE);
+
+        proxy.drain_master_output(Duration::from_millis(10));
+
+        assert!(proxy.screen_plaintext().contains("final child stderr line"));
     }
 
     #[test]

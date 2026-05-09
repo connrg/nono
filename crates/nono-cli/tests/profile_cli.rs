@@ -86,6 +86,14 @@ fn test_show_profile_output() {
         stdout.contains("Security groups"),
         "expected Security groups section, got:\n{stdout}"
     );
+    assert!(
+        !stdout.contains("Policy patches"),
+        "default profile should not repeat resolved groups as policy patches:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("groups.include"),
+        "human profile show should not leak canonical groups.include for resolved groups:\n{stdout}"
+    );
 }
 
 #[test]

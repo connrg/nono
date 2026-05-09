@@ -497,7 +497,8 @@ IN-BAND DETACH:
   nono profile list                            # List all profiles (built-in and user)
   nono profile show claude-code                # Show a fully resolved profile
   nono profile diff default claude-code        # Compare two profiles
-  nono profile validate ~/my-profile.json      # Validate a user profile file
+  nono profile validate my-agent               # Validate a profile by name
+  nono profile validate ~/my-profile.json      # Validate a profile file
   nono profile validate --draft my-profile     # Validate a profile draft
   nono profile promote my-profile              # Review and apply a profile draft
   nono profile groups                          # List all policy groups
