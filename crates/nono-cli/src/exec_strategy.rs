@@ -1754,8 +1754,8 @@ fn detach_client_for_session(pty: &mut crate::pty_proxy::PtyProxy) -> bool {
     pty.detach()
 }
 
-fn restore_terminal_after_detach() {
-    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO);
+fn restore_terminal_after_detach(in_alt_screen: bool) {
+    crate::pty_proxy::write_detach_terminal_reset(libc::STDOUT_FILENO, in_alt_screen);
     crate::pty_proxy::write_detach_notice(libc::STDERR_FILENO);
 }
 
@@ -1797,8 +1797,13 @@ fn handle_pty_detach_request(
     if in_band_detach_requested {
         info!("PTY detach requested via in-band key sequence");
     }
-    if (pause_requested || in_band_detach_requested) && pty.is_some_and(detach_client_for_session) {
-        restore_terminal_after_detach();
+    if let Some(p) = pty {
+        if pause_requested || in_band_detach_requested {
+            let in_alt_screen = p.in_alt_screen();
+            if detach_client_for_session(p) {
+                restore_terminal_after_detach(in_alt_screen);
+            }
+        }
     }
 }
 
