@@ -43,12 +43,62 @@ const ATTACH_ACK_BUSY: u8 = 1;
 const ATTACH_ACK_DENIED: u8 = 2;
 const ATTACH_REQUEST_ATTACH: u8 = 0;
 const ATTACH_REQUEST_DETACH: u8 = 1;
-const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] =
-    b"\x1b[0m\x1b(B\x1b)B\x0f\x1b[r\x1b[?6l\x1b[?1049h\x1b[?25h\x1b[2J\x1b[H";
-const TERMINAL_RESTORE_ESCAPE: &[u8] = b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1049l\x1b[?25h";
-const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] =
-    b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?1049l\x1b[?25h\x1b[2J\x1b[H";
-const TERMINAL_RESTORE_NORMAL: &[u8] = b"\x1b[<u\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?25h";
+// Composed terminal escape sequences. Each concat! block documents its
+// individual CSI sequences inline so the byte-level intent is auditable
+// without having to decode raw hex.
+const ENTER_ALT_SCREEN: &str = "\x1b[?1049h";
+const EXIT_ALT_SCREEN: &str = "\x1b[?1049l";
+
+const ATTACH_SCREEN_ENTER_ESCAPE: &[u8] = concat!(
+    "\x1b[0m",       // reset attributes
+    "\x1b(B\x1b)B",  // set G0/G1 charset to ASCII
+    "\x0f",          // shift-in (select G0)
+    "\x1b[r",        // reset scroll region
+    "\x1b[?6l",      // disable origin mode
+    "\x1b[?1049h",   // enter alternate screen
+    "\x1b[?25h",     // show cursor
+    "\x1b[2J\x1b[H", // clear screen + cursor home
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_NORMAL: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?25h", // show cursor
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_ESCAPE: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1049l", // exit alternate screen
+    "\x1b[?25h", // show cursor
+)
+.as_bytes();
+
+const TERMINAL_RESTORE_AND_CLEAR_ESCAPE: &[u8] = concat!(
+    "\x1b[<u", // restore cursor (kitty private)
+    "\x1b[>0n\x1b[>1n\x1b[>2n\x1b[>3n\x1b[>4n\x1b[>6n\x1b[>7n", // disable key reporting
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l", // disable mouse tracking
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l", // disable mouse encodings
+    "\x1b[?1004l", // disable focus events
+    "\x1b[?2004l", // disable bracketed paste
+    "\x1b[?1l", // disable application cursor keys
+    "\x1b>",   // normal keypad mode
+    "\x1b[?1049l", // exit alternate screen
+    "\x1b[?25h", // show cursor
+    "\x1b[2J\x1b[H", // clear screen + cursor home
+)
+.as_bytes();
+
 const CLEAR_PARENT_OUTPUT_AREA: &[u8] = b"\r\x1b[K\x1b[J";
 
 static ATTACH_RESIZE_PIPE_READ: AtomicI32 = AtomicI32::new(-1);
@@ -1231,7 +1281,7 @@ fn compose_replay_body(
     }
 }
 
-/// `CSI 3 J` — erase saved lines (xterm). Wipes the outer terminal's native
+/// CSI 3 J — erase saved lines (xterm). Wipes the outer terminal's native
 /// scrollback buffer without touching the currently visible area.
 const ERASE_NATIVE_SCROLLBACK: &[u8] = b"\x1b[3J";
 
@@ -1366,11 +1416,7 @@ impl Drop for PtyProxy {
             .as_ref()
             .is_some_and(AttachedClient::is_terminal)
         {
-            if self.screen.alternate_screen_active() {
-                write_detach_terminal_reset(libc::STDOUT_FILENO, true);
-            } else {
-                let _ = write_all_fd(libc::STDOUT_FILENO, TERMINAL_RESTORE_NORMAL);
-            }
+            write_detach_terminal_reset(libc::STDOUT_FILENO, self.screen.alternate_screen_active());
         }
         self.restore_terminal();
         let _ = std::fs::remove_file(&self.attach_path);
@@ -1433,8 +1479,8 @@ struct AltScreenTracker {
     tail: Vec<u8>,
 }
 
-const ALT_SCREEN_ENTER_SEQ: &[u8] = b"\x1b[?1049h";
-const ALT_SCREEN_EXIT_SEQ: &[u8] = b"\x1b[?1049l";
+const ALT_SCREEN_ENTER_SEQ: &[u8] = ENTER_ALT_SCREEN.as_bytes();
+const ALT_SCREEN_EXIT_SEQ: &[u8] = EXIT_ALT_SCREEN.as_bytes();
 
 impl AltScreenTracker {
     fn observe(&mut self, bytes: &[u8]) {
@@ -1628,9 +1674,7 @@ pub(crate) fn write_detach_terminal_reset(fd: RawFd, in_alt_screen: bool) {
     } else {
         TERMINAL_RESTORE_NORMAL
     };
-    unsafe {
-        libc::write(fd, esc.as_ptr().cast(), esc.len());
-    }
+    let _ = write_all_fd(fd, esc);
 }
 
 pub(crate) fn write_detach_notice(fd: RawFd) {
