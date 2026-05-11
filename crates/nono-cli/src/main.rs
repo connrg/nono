@@ -83,7 +83,6 @@ use command_blocking_deprecation::{
     collect_cli_warnings, print_warnings as print_deprecation_warnings,
 };
 use nono::Result;
-use tracing::error;
 
 const DETACHED_LAUNCH_ENV: &str = "NONO_DETACHED_LAUNCH";
 const DETACHED_CWD_PROMPT_RESPONSE_ENV: &str = "NONO_DETACHED_CWD_PROMPT_RESPONSE";
@@ -121,7 +120,6 @@ fn main() {
         if matches!(e, nono::NonoError::Cancelled(_)) {
             std::process::exit(1);
         }
-        error!("{}", e);
         eprintln!("nono: {}", e);
         std::process::exit(1);
     }
