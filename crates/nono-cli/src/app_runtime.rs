@@ -17,7 +17,7 @@ use crate::startup_runtime::{
 use crate::trust_cmd;
 use crate::update_check;
 use crate::why_runtime::run_why;
-use crate::{Result, DETACHED_LAUNCH_ENV};
+use crate::{DETACHED_LAUNCH_ENV, Result};
 
 pub(crate) fn run(cli: Cli) -> Result<()> {
     let mut update_handle = start_update_check_handle(&cli);
@@ -107,6 +107,15 @@ fn dispatch_command(
         }
         Commands::List(args) => {
             run_command_with_update(update_handle, silent, || package_cmd::run_list(args))
+        }
+        Commands::Pin(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_pin(args))
+        }
+        Commands::Unpin(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_unpin(args))
+        }
+        Commands::Outdated(args) => {
+            run_command_with_update(update_handle, silent, || package_cmd::run_outdated(args))
         }
         Commands::OpenUrlHelper(args) => run_open_url_helper(args),
         Commands::Completions(args) => run_completions(args),

@@ -51,6 +51,9 @@ const STYLES: Styles = Styles::plain().header(Style::new().bold());
   pull       Install a signed nono pack from the registry
   remove     Remove an installed nono pack
   update     Update installed nono packs
+  outdated   Show which installed packs have newer versions available
+  pin        Pin a pack to its current version
+  unpin      Unpin a pack to re-include it in updates
   search     Search the registry for nono packs
   list       List installed nono packs
 
@@ -555,6 +558,8 @@ IN-BAND DETACH:
     #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
   nono update
   nono update always-further/claude
+  nono update --dry-run
+  nono update --force                          # also update pinned packs
 ")]
     Update(UpdateArgs),
 
@@ -587,6 +592,49 @@ IN-BAND DETACH:
   nono list --installed --json
 ")]
     List(ListArgs),
+
+    /// Pin an installed pack to its current version, excluding it from updates
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono pin <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono pin always-further/claude
+")]
+    Pin(PinArgs),
+
+    /// Unpin a pack so it is included in updates again
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono unpin <namespace>/<name>
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono unpin always-further/claude
+")]
+    Unpin(UnpinArgs),
+
+    /// Show which installed packs have newer versions available
+    #[command(help_template = "\
+{about}
+
+\x1b[1mUSAGE\x1b[0m
+  nono outdated [flags]
+
+{all-args}
+{after-help}")]
+    #[command(after_help = "\x1b[1mEXAMPLES\x1b[0m
+  nono outdated
+  nono outdated --json
+")]
+    Outdated(OutdatedArgs),
 
     /// Generate shell completion scripts
     #[command(name = "completion")]
@@ -674,7 +722,11 @@ pub struct UpdateArgs {
     )]
     pub registry: Option<String>,
 
-    /// Accept signer changes
+    /// Show what would be updated without making changes
+    #[arg(long, help_heading = "OPTIONS")]
+    pub dry_run: bool,
+
+    /// Update pinned packs and accept signer changes
     #[arg(long, help_heading = "OPTIONS")]
     pub force: bool,
 
@@ -713,6 +765,49 @@ pub struct ListArgs {
     /// Show installed nono packs
     #[arg(long, help_heading = "OPTIONS")]
     pub installed: bool,
+
+    /// Output as JSON
+    #[arg(long, help_heading = "OPTIONS")]
+    pub json: bool,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct PinArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct UnpinArgs {
+    /// Installed package reference (<namespace>/<name>)
+    pub package_ref: String,
+
+    /// Print help
+    #[arg(long, short = 'h', action = clap::ArgAction::Help, help_heading = "OPTIONS")]
+    pub help: Option<bool>,
+}
+
+#[derive(Parser, Debug)]
+#[command(disable_help_flag = true)]
+pub struct OutdatedArgs {
+    /// Registry base URL
+    #[arg(
+        long,
+        env = "NONO_REGISTRY",
+        value_name = "URL",
+        help_heading = "OPTIONS"
+    )]
+    pub registry: Option<String>,
 
     /// Output as JSON
     #[arg(long, help_heading = "OPTIONS")]
@@ -3442,12 +3537,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["nono", "profile", "show", "default", "--format", "manifest"])
                 .expect("profile show --format manifest must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert_eq!(a.profile, "default");
-                assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert_eq!(a.profile, "default");
+            assert!(matches!(a.format, Some(ProfileShowFormat::Manifest)));
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3456,12 +3551,12 @@ mod tests {
     fn test_profile_show_parses_with_json_and_raw() {
         let cli = Cli::try_parse_from(["nono", "profile", "show", "default", "--json", "--raw"])
             .expect("profile show --json --raw must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Show(a) = args.command {
-                assert!(a.json);
-                assert!(a.raw);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Show(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.raw);
+            return;
         }
         panic!("expected Commands::Profile(Show(..))");
     }
@@ -3470,12 +3565,12 @@ mod tests {
     fn test_profile_groups_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "--json", "--all-platforms"])
             .expect("profile groups --json --all-platforms must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert!(a.json);
-                assert!(a.all_platforms);
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert!(a.json);
+            assert!(a.all_platforms);
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3484,11 +3579,11 @@ mod tests {
     fn test_profile_groups_with_name() {
         let cli = Cli::try_parse_from(["nono", "profile", "groups", "deny_credentials"])
             .expect("profile groups <name> must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Groups(a) = args.command {
-                assert_eq!(a.name.as_deref(), Some("deny_credentials"));
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Groups(a) = args.command
+        {
+            assert_eq!(a.name.as_deref(), Some("deny_credentials"));
+            return;
         }
         panic!("expected Commands::Profile(Groups(..))");
     }
@@ -3497,12 +3592,12 @@ mod tests {
     fn test_profile_diff_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "diff", "a", "b"])
             .expect("profile diff must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Diff(a) = args.command {
-                assert_eq!(a.profile1, "a");
-                assert_eq!(a.profile2, "b");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Diff(a) = args.command
+        {
+            assert_eq!(a.profile1, "a");
+            assert_eq!(a.profile2, "b");
+            return;
         }
         panic!("expected Commands::Profile(Diff(..))");
     }
@@ -3511,11 +3606,11 @@ mod tests {
     fn test_profile_validate_parses() {
         let cli = Cli::try_parse_from(["nono", "profile", "validate", "/tmp/p.json"])
             .expect("profile validate must parse");
-        if let Commands::Profile(args) = cli.command {
-            if let ProfileCommands::Validate(a) = args.command {
-                assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
-                return;
-            }
+        if let Commands::Profile(args) = cli.command
+            && let ProfileCommands::Validate(a) = args.command
+        {
+            assert_eq!(a.file.to_string_lossy(), "/tmp/p.json");
+            return;
         }
         panic!("expected Commands::Profile(Validate(..))");
     }
@@ -3544,6 +3639,9 @@ mod tests {
         "pull",
         "remove",
         "update",
+        "outdated",
+        "pin",
+        "unpin",
         "search",
         "list",
         "completion",

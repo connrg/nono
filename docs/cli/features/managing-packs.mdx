@@ -1,6 +1,6 @@
 ---
 title: Managing Packs
-description: Install, update, remove, search, and list nono packs
+description: Install, update, pin, remove, search, and list nono packs
 ---
 
 Packs are signed bundles of profiles, hooks, plugins, and other artifacts distributed through the nono registry. This page covers the consumer side — installing and managing packs on your machine.
@@ -54,6 +54,32 @@ nono pull always-further/claude --force
   `--force` bypasses the signer-change prompt. Only use this when you trust the new signer identity.
 </Warning>
 
+## Inline Update Hints
+
+When you run `nono run --profile <name>`, nono checks whether any pack in the active profile's extends chain has a newer version available and prints a one-line hint if so:
+
+```
+  update available  always-further/claude  0.0.12 → 0.0.13   run: nono update
+```
+
+Results are cached for 24 hours so the check never blocks startup. A background thread refreshes stale entries for the next run. The hint respects the same opt-out as the CLI update check: set `NONO_NO_UPDATE_CHECK=1` or `[updates] check = false` in `~/.config/nono/config.toml` to suppress it.
+
+## Checking for Updates
+
+See which installed packs have newer versions available:
+
+```bash
+nono outdated
+```
+
+Machine-readable output:
+
+```bash
+nono outdated --json
+```
+
+Each entry reports the installed version, the latest available version, and the status (`outdated`, `yanked`, `current`, `ahead`).
+
 ## Updating Packs
 
 Update all installed packs to their latest versions:
@@ -69,6 +95,34 @@ nono update always-further/claude
 ```
 
 The update checks the registry for newer versions, verifies signatures, and replaces local artifacts. Signer identity changes trigger a confirmation prompt (use `--force` to skip).
+
+Preview what would change without making updates:
+
+```bash
+nono update --dry-run
+```
+
+Pinned packs are skipped by default. Pass `--force` to update them:
+
+```bash
+nono update --force
+```
+
+## Pinning Packs
+
+Pin a pack to prevent it from being updated by `nono update`:
+
+```bash
+nono pin always-further/claude
+```
+
+Unpin to allow updates again:
+
+```bash
+nono unpin always-further/claude
+```
+
+Pinned packs are still shown by `nono outdated`. The pin state is local — it does not affect other users or the registry.
 
 ## Removing a Pack
 

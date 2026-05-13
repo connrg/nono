@@ -377,6 +377,14 @@ The pack store is the single source of truth — every Claude-side path is a sym
 
 Once installed, `nono run --profile claude-code -- claude` runs silently — no prompt. nono's profile resolver finds `claude-code` in the pack store and re-asserts the marketplace wiring on every run, so deleting any of the symlinks above is recovered transparently on the next `nono run`.
 
+If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
+
+```
+  update available  always-further/claude  0.0.12 → 0.0.13   run: nono update
+```
+
+Run `nono update` to apply it, or `nono outdated` to check all installed packs at once. See [Managing Packs](/cli/features/managing-packs) for pinning and other options.
+
 ### Skipping or Automating the Prompt
 
 | Environment | Behaviour |

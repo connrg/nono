@@ -107,6 +107,14 @@ note: Codex hooks need this in ~/.codex/config.toml to fire — add it once and 
 
 Once installed, `nono run --profile codex -- codex` runs silently — no prompt. nono's profile resolver finds `codex` in the pack store and re-asserts the marketplace + cache wiring on every run, so deleting any of the entries above is recovered transparently on the next `nono run`.
 
+If a newer version of the pack is available, nono prints a one-line hint after the capabilities block:
+
+```
+  update available  always-further/codex  0.0.11 → 0.0.12   run: nono update
+```
+
+Run `nono update` to apply it, or `nono outdated` to check all installed packs at once. See [Managing Packs](/cli/features/managing-packs) for pinning and other options.
+
 ### Skipping or automating the prompt
 
 | Environment | Behaviour |

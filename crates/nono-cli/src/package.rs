@@ -41,6 +41,8 @@ pub struct PackageManifest {
     pub schema_version: u32,
     pub name: String,
     #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub license: Option<String>,
@@ -117,6 +119,8 @@ pub struct LockedPackage {
     pub version: String,
     pub installed_at: String,
     #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
     pub provenance: Option<PackageProvenance>,
     #[serde(default)]
     pub artifacts: BTreeMap<String, LockedArtifact>,
@@ -152,6 +156,7 @@ impl Default for LockedPackage {
         Self {
             version: String::new(),
             installed_at: Utc::now().to_rfc3339(),
+            pinned: false,
             provenance: None,
             artifacts: BTreeMap::new(),
             wiring_record: Vec::new(),
@@ -172,6 +177,18 @@ pub struct PackageSearchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageSearchResponse {
     pub packages: Vec<PackageSearchResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct YankedErrorResponse {
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub yanked: bool,
+    #[serde(default)]
+    pub yank_reason: Option<String>,
+    #[serde(default)]
+    pub advisory: Option<PackageAdvisory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

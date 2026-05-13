@@ -1,5 +1,56 @@
 # Changelog
 
+## [0.54.0] - 2026-05-13
+
+### Bug Fixes
+
+- *(pack-update-hint)* Treat unparsable installed as older in update check
+
+- Macos lint
+
+- Macos lint
+
+- Macos lint
+
+- *(snapshot)* Validate restore targets against symlinks
+
+- *(platform)* Correctly parse windows registry dword values
+
+
+### Dependencies
+
+- *(deps)* Bump nix from 0.31.2 to 0.31.3
+
+- *(deps)* Bump sigstore/cosign-installer from 4.1.1 to 4.1.2
+
+- *(deps)* Bump tokio from 1.52.2 to 1.52.3
+
+
+### Features
+
+- *(pack-hints)* Document inline pack update hints
+
+- *(pack_update_hint)* Refresh hints synchronously on first run
+
+- *(packs)* Add pinning, outdated, and clarify publishing versioning
+
+- *(cli)* Implement `nono update` command
+
+- *(package)* Add package pinning and outdated commands
+
+- Upgrade to Rust edition 2024, centralize workspace dependencies
+
+- *(platform)* Implement robust windows platform detection
+
+- *(profile)* Add platform-conditional profile fields
+
+
+### Style
+
+- *(cli)* Adjust line breaks and module order
+
+- *(cli)* Improve formatting and simplify error handling
+
 ## [0.53.0] - 2026-05-11
 
 ### Bug Fixes
