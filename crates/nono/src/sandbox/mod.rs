@@ -18,9 +18,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::{extension_consume, extension_issue_file, extension_release};
 
-// Re-export Linux Landlock ABI detection
+// Re-export Linux Landlock ABI detection and scope policy reporting
 #[cfg(target_os = "linux")]
-pub use linux::{DetectedAbi, detect_abi};
+pub use linux::{DetectedAbi, LandlockScopePolicy, detect_abi, landlock_scope_policy};
 
 // Re-export Linux WSL2 detection
 #[cfg(target_os = "linux")]

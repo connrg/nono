@@ -1,5 +1,6 @@
 use crate::capability_ext::CapabilitySetExt;
-use crate::cli::{SandboxArgs, WhyArgs, WhyOp};
+use crate::cli::{SandboxArgs, WhyArgs, WhyOp, WhyScope};
+use crate::query_ext::ScopeQuery;
 use crate::{network_policy, policy, profile, query_ext, sandbox_state};
 use nono::{AccessMode, CapabilitySet, NonoError, Result};
 
@@ -42,7 +43,7 @@ fn resolve_allowed_domains(profile: &profile::Profile) -> Vec<String> {
 }
 
 pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
-    use query_ext::{QueryResult, print_result, query_network, query_path};
+    use query_ext::{QueryResult, print_result, query_network, query_path, query_scope};
     use sandbox_state::load_sandbox_state;
 
     let ctx: WhyContext = if args.self_query {
@@ -149,9 +150,11 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
         query_path(path, op, &ctx.caps, &ctx.overridden_paths)?
     } else if let Some(ref host) = args.host {
         query_network(host, args.port, &ctx.caps, &ctx.allowed_domains)
+    } else if let Some(ref scope) = args.scope {
+        query_scope(scope_query(scope), &ctx.caps)
     } else {
         return Err(NonoError::ConfigParse(
-            "--path or --host is required".to_string(),
+            "--path, --host, or --scope is required".to_string(),
         ));
     };
 
@@ -164,4 +167,11 @@ pub(crate) fn run_why(args: WhyArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn scope_query(scope: &WhyScope) -> ScopeQuery {
+    match scope {
+        WhyScope::Signal => ScopeQuery::Signal,
+        WhyScope::AbstractUnixSocket => ScopeQuery::AbstractUnixSocket,
+    }
 }
