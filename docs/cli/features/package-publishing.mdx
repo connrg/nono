@@ -67,6 +67,7 @@ Example for a Claude Code integration pack:
 {
   "schema_version": 1,
   "name": "claude",
+  "version": "0.1.0",
   "description": "Claude Code plugin and matching nono profile",
   "license": "Apache-2.0",
   "platforms": ["macos", "linux"],
@@ -81,6 +82,8 @@ Example for a Claude Code integration pack:
   ]
 }
 ```
+
+`version` is required and must be valid semver (e.g. `1.2.3` or `0.1.0` — not `v0.1.0`, `claude-v0.1.0`, or `main`). The registry validates this at publish time and rejects non-semver strings. Bump this field before pushing a release tag — it is the canonical version, not the tag name.
 
 Important constraints:
 
@@ -234,12 +237,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Read version from package.json
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version' packages/claude-code/package.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "ERROR: package.json is missing a 'version' field"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Publish package
         uses: <registry-repo>/action@main
         with:
           package-name: claude-code
           package-namespace: acme-corp
-          version: ${{ github.ref_name }}
+          version: ${{ steps.version.outputs.version }}
           path: packages/claude-code
           files: |
             package.json
@@ -251,6 +265,8 @@ jobs:
 ```
 
 Replace `<registry-repo>` with the repository that publishes the action. The current action source lives in `nono-registry/action/`.
+
+The version comes from `package.json`, not from the tag name. Bump `version` in `package.json`, commit it, then push the tag. The registry cross-checks that the uploaded `package.json` version matches the declared version and rejects mismatches.
 
 ### Required Workflow Permissions
 
@@ -366,7 +382,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - id: files
+
+      - name: Read version from package.json
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r '.version' claude/package.json)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "ERROR: claude/package.json is missing a 'version' field"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Build files list from package.json
+        id: files
         run: |
           set -euo pipefail
           {
@@ -379,18 +408,19 @@ jobs:
             cat /tmp/files.txt
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
       - uses: always-further/agent-sign@<pinned-sha>
         with:
           publish: "true"
           package-name: claude
           package-namespace: <your-org>
-          package-version: ${{ github.ref_name }}
+          package-version: ${{ steps.version.outputs.version }}
           package-path: claude
           registry-url: https://registry.nono.sh/api/v1
           files: ${{ steps.files.outputs.files }}
 ```
 
-To add a third pack, copy the file and replace `claude` with the new pack name throughout (5 occurrences).
+To add a third pack, copy the file and replace `claude` with the new pack name throughout.
 
 The trusted publisher entry per pack pins to the matching workflow path and tag pattern:
 
@@ -502,10 +532,11 @@ Adding an entry causes three things to happen automatically:
 The cleanest setup is:
 
 1. Keep each pack in a dedicated subdirectory of the publishing repository.
-2. One per-pack trigger workflow plus one shared reusable workflow (see [Independent Releases for Multi-Pack Monorepos](#independent-releases-for-multi-pack-monorepos)).
+2. One fully inlined per-pack workflow per pack (see [Independent Releases for Multi-Pack Monorepos](#independent-releases-for-multi-pack-monorepos)).
 3. Register one trusted publisher per pack, pinned to its workflow path and tag prefix.
-4. Publish immutable releases from per-pack tags such as `claude-v1.2.0`.
-5. Use `refs/tags/<pack>-v*` as the trusted publisher ref pattern.
-5. Validate every release with a fresh `nono pull` against the intended registry.
+4. **Bump `"version"` in `package.json` and commit it** before pushing a release tag. The `version` field is the canonical version — the tag is just a trigger.
+5. Push a per-pack tag such as `claude-v1.2.0` to trigger the workflow.
+6. Use `refs/tags/<pack>-v*` as the trusted publisher ref pattern.
+7. Validate every release with a fresh `nono pull` against the intended registry.
 
-That gives consumers a straight provenance chain from installed artifacts back to a specific repository, workflow, and Git ref.
+That gives consumers a straight provenance chain from installed artifacts back to a specific repository, workflow, and Git ref. The version in `package.json` is always what the registry received — no tag-name parsing required.

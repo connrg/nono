@@ -33,6 +33,7 @@ mod open_url_runtime;
 mod output;
 mod package;
 mod package_cmd;
+mod pack_update_hint;
 mod package_status;
 mod platform;
 mod policy;
