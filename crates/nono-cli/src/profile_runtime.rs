@@ -199,6 +199,10 @@ fn verify_stored_bundles(
                     pack_ref
                 ))
             })?;
+        let installed_path = entry
+            .get("installed_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(artifact_name);
 
         let bundle_value = entry.get("bundle").ok_or_else(|| {
             nono::NonoError::PackageInstall(format!(
@@ -206,8 +210,21 @@ fn verify_stored_bundles(
                 artifact_name, pack_ref
             ))
         })?;
+        let expected_digest = entry
+            .get("digest")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry missing 'digest' field for '{}' in pack '{}'",
+                    artifact_name, pack_ref
+                ))
+            })?;
 
-        let artifact_path = install_dir.join(artifact_name);
+        let artifact_path = install_dir.join(validate_bundle_relative_path(
+            installed_path,
+            artifact_name,
+            pack_ref,
+        )?);
         if !artifact_path.exists() {
             continue;
         }
@@ -231,7 +248,19 @@ fn verify_stored_bundles(
             Path::new(&format!("{}.bundle", artifact_name)),
         )?;
 
-        nono::trust::verify_bundle_subject_name(&bundle, Path::new(artifact_name))?;
+        let subjects = nono::trust::extract_all_subjects(
+            &bundle,
+            Path::new(&format!("{}.bundle", artifact_name)),
+        )?;
+        if !subjects
+            .iter()
+            .any(|(name, digest)| name == artifact_name && digest == expected_digest)
+        {
+            return Err(nono::NonoError::PackageInstall(format!(
+                "trust bundle for '{}' in pack '{}' does not contain the expected subject digest",
+                artifact_name, pack_ref
+            )));
+        }
         nono::trust::verify_bundle(
             &artifact_bytes,
             &bundle,
@@ -279,6 +308,32 @@ fn verify_stored_bundles(
     }
 
     Ok(())
+}
+
+fn validate_bundle_relative_path<'a>(
+    installed_path: &'a str,
+    artifact_name: &str,
+    pack_ref: &str,
+) -> crate::Result<&'a Path> {
+    let path = Path::new(installed_path);
+    if installed_path.is_empty() || path.is_absolute() {
+        return Err(nono::NonoError::PackageInstall(format!(
+            "trust bundle entry for '{}' in pack '{}' has unsafe installed_path '{}'",
+            artifact_name, pack_ref, installed_path
+        )));
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(_) => {}
+            _ => {
+                return Err(nono::NonoError::PackageInstall(format!(
+                    "trust bundle entry for '{}' in pack '{}' has unsafe installed_path '{}'",
+                    artifact_name, pack_ref, installed_path
+                )));
+            }
+        }
+    }
+    Ok(path)
 }
 
 fn expand_bypass_protection_path(path: &Path, workdir: &Path) -> PathBuf {

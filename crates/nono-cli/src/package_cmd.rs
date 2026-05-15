@@ -99,6 +99,7 @@ pub fn run_pull(args: PullArgs) -> Result<()> {
         &registry_url,
         &pull,
         &signer_identity,
+        &manifest,
         &downloads.artifacts,
         &install.wiring_record,
     )?;
@@ -784,7 +785,8 @@ fn install_package(
         downloaded_by_name.insert(artifact.filename.as_str(), artifact);
     }
 
-    write_supporting_artifacts(&staging_root, downloads)?;
+    validate_manifest_install_paths(manifest)?;
+    write_supporting_artifacts(&staging_root, manifest, downloads)?;
 
     let mut copied_to_project = 0usize;
     for artifact in &manifest.artifacts {
@@ -843,7 +845,11 @@ fn install_package(
     })
 }
 
-fn write_supporting_artifacts(staging_root: &Path, downloads: &VerifiedDownloads) -> Result<()> {
+fn write_supporting_artifacts(
+    staging_root: &Path,
+    manifest: &PackageManifest,
+    downloads: &VerifiedDownloads,
+) -> Result<()> {
     for artifact in &downloads.artifacts {
         if artifact.filename == "package.json" {
             let path = staging_root.join("package.json");
@@ -851,22 +857,43 @@ fn write_supporting_artifacts(staging_root: &Path, downloads: &VerifiedDownloads
         }
     }
 
+    let downloaded_by_name = downloads
+        .artifacts
+        .iter()
+        .map(|artifact| (artifact.filename.as_str(), artifact))
+        .collect::<HashMap<_, _>>();
+
     // Write per-artifact bundles into a single JSON array at the pack root
     let bundle =
         serde_json::from_str::<serde_json::Value>(&downloads.bundle_json).map_err(|e| {
             NonoError::PackageInstall(format!("failed to parse trust bundle from registry: {e}"))
         })?;
-    let bundles: Vec<serde_json::Value> = downloads
-        .artifacts
-        .iter()
-        .map(|artifact| {
-            serde_json::json!({
-                "artifact": artifact.filename,
-                "digest": artifact.sha256_digest,
-                "bundle": bundle.clone()
-            })
-        })
-        .collect();
+    let mut bundles: Vec<serde_json::Value> = Vec::new();
+    if let Some(package_json) = downloaded_by_name.get("package.json") {
+        bundles.push(serde_json::json!({
+            "artifact": package_json.filename,
+            "installed_path": "package.json",
+            "digest": package_json.sha256_digest,
+            "bundle": bundle.clone()
+        }));
+    }
+    for artifact in &manifest.artifacts {
+        let downloaded = downloaded_by_name
+            .get(artifact.path.as_str())
+            .ok_or_else(|| {
+                NonoError::PackageInstall(format!(
+                    "manifest references missing artifact '{}'",
+                    artifact.path
+                ))
+            })?;
+        let installed_path = installed_artifact_relative_path(artifact)?;
+        bundles.push(serde_json::json!({
+            "artifact": downloaded.filename,
+            "installed_path": installed_path,
+            "digest": downloaded.sha256_digest,
+            "bundle": bundle.clone()
+        }));
+    }
 
     if !bundles.is_empty() {
         let bundle_path = staging_root.join(".nono-trust.bundle");
@@ -888,29 +915,17 @@ fn install_manifest_artifact(
     artifact: &ArtifactEntry,
     source_path: &Path,
 ) -> Result<()> {
+    let relative_path = installed_artifact_relative_path(artifact)?;
+    let path = staging_root.join(&relative_path);
     match artifact.artifact_type {
         ArtifactType::Profile => {
-            let install_name = artifact.install_as.as_deref().ok_or_else(|| {
-                NonoError::PackageInstall(format!(
-                    "profile artifact '{}' is missing install_as",
-                    artifact.path
-                ))
-            })?;
-            validate_safe_name(install_name, "install_as")?;
-            let path = staging_root
-                .join("profiles")
-                .join(format!("{install_name}.json"));
             copy_path(source_path, &path)?;
             parse_json::<crate::profile::Profile>(&path)?;
         }
         ArtifactType::Instruction => {
-            let path = staging_root
-                .join("instructions")
-                .join(file_name(&artifact.path)?);
             copy_path(source_path, &path)?;
         }
         ArtifactType::TrustPolicy => {
-            let path = staging_root.join("trust-policy.json");
             copy_path(source_path, &path)?;
             let content = fs::read_to_string(&path).map_err(NonoError::Io)?;
             nono::trust::load_policy_from_str(&content)?;
@@ -922,14 +937,11 @@ fn install_manifest_artifact(
                     artifact.path
                 ))
             })?;
-            let path = staging_root.join("groups.json");
             copy_path(source_path, &path)?;
             let bytes = fs::read(&path).map_err(NonoError::Io)?;
             validate_groups(&bytes, prefix)?;
         }
         ArtifactType::Plugin => {
-            validate_relative_path(&artifact.path)?;
-            let path = staging_root.join(&artifact.path);
             copy_path(source_path, &path)?;
             if artifact.path.contains("/bin/") || artifact.path.ends_with(".sh") {
                 ensure_executable(&path)?;
@@ -977,6 +989,7 @@ fn update_lockfile(
     registry_url: &str,
     pull: &PullResponse,
     signer_identity: &str,
+    manifest: &PackageManifest,
     downloads: &[DownloadedArtifact],
     wiring_record: &[crate::wiring::WiringRecord],
 ) -> Result<()> {
@@ -990,19 +1003,37 @@ fn update_lockfile(
         .map(|p| p.pinned)
         .unwrap_or(false);
 
-    let artifacts = downloads
+    let downloaded_by_name = downloads
         .iter()
-        .filter(|artifact| artifact.filename != "package.json")
-        .map(|artifact| {
-            (
-                artifact.filename.clone(),
+        .map(|artifact| (artifact.filename.as_str(), artifact))
+        .collect::<HashMap<_, _>>();
+    let mut artifacts = BTreeMap::new();
+    for artifact in &manifest.artifacts {
+        let downloaded = downloaded_by_name
+            .get(artifact.path.as_str())
+            .ok_or_else(|| {
+                NonoError::PackageInstall(format!(
+                    "manifest references missing artifact '{}'",
+                    artifact.path
+                ))
+            })?;
+        let installed_path = installed_artifact_relative_path(artifact)?;
+        if artifacts
+            .insert(
+                installed_path.clone(),
                 LockedArtifact {
-                    sha256: artifact.sha256_digest.clone(),
-                    artifact_type: infer_artifact_type(&artifact.filename),
+                    sha256: downloaded.sha256_digest.clone(),
+                    artifact_type: artifact.artifact_type.clone(),
                 },
             )
-        })
-        .collect::<BTreeMap<_, _>>();
+            .is_some()
+        {
+            return Err(NonoError::PackageInstall(format!(
+                "multiple artifacts install to the same path '{}' (conflict at '{}')",
+                installed_path, artifact.path
+            )));
+        }
+    }
 
     lockfile.packages.insert(
         package_ref.key(),
@@ -1028,6 +1059,20 @@ fn update_lockfile(
     );
 
     package::write_lockfile(&lockfile)
+}
+
+fn validate_manifest_install_paths(manifest: &PackageManifest) -> Result<()> {
+    let mut installed_paths = HashSet::with_capacity(manifest.artifacts.len());
+    for artifact in &manifest.artifacts {
+        let installed_path = installed_artifact_relative_path(artifact)?;
+        if !installed_paths.insert(installed_path.clone()) {
+            return Err(NonoError::PackageInstall(format!(
+                "multiple artifacts install to the same path '{}' (conflict at '{}')",
+                installed_path, artifact.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn enforce_namespace_assertion(
@@ -1104,16 +1149,6 @@ fn signer_identity_uri(identity: &SignerIdentity) -> Result<String> {
     }
 }
 
-fn infer_artifact_type(filename: &str) -> ArtifactType {
-    match filename {
-        "groups.json" => ArtifactType::Groups,
-        "trust-policy.json" => ArtifactType::TrustPolicy,
-        name if name.ends_with(".profile.json") => ArtifactType::Profile,
-        name if name.ends_with(".md") => ArtifactType::Instruction,
-        _ => ArtifactType::Plugin,
-    }
-}
-
 fn parse_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     let content = fs::read_to_string(path).map_err(NonoError::Io)?;
     serde_json::from_str(&content)
@@ -1145,6 +1180,38 @@ fn file_name(path: &str) -> Result<&str> {
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| NonoError::PackageInstall(format!("invalid artifact path '{}'", path)))
+}
+
+fn installed_artifact_relative_path(artifact: &ArtifactEntry) -> Result<String> {
+    let path = match artifact.artifact_type {
+        ArtifactType::Profile => {
+            let install_name = artifact.install_as.as_deref().ok_or_else(|| {
+                NonoError::PackageInstall(format!(
+                    "profile artifact '{}' is missing install_as",
+                    artifact.path
+                ))
+            })?;
+            validate_safe_name(install_name, "install_as")?;
+            format!("profiles/{install_name}.json")
+        }
+        ArtifactType::Instruction => {
+            validate_relative_path(&artifact.path)?;
+            format!("instructions/{}", file_name(&artifact.path)?)
+        }
+        ArtifactType::TrustPolicy => "trust-policy.json".to_string(),
+        ArtifactType::Groups => "groups.json".to_string(),
+        ArtifactType::Plugin => {
+            validate_relative_path(&artifact.path)?;
+            artifact.path.clone()
+        }
+    };
+    if path == "package.json" || path == ".nono-trust.bundle" {
+        return Err(NonoError::PackageInstall(format!(
+            "artifact '{}' attempts to overwrite reserved file '{}'",
+            artifact.path, path
+        )));
+    }
+    Ok(path)
 }
 
 fn validate_safe_name(name: &str, field: &str) -> Result<()> {
