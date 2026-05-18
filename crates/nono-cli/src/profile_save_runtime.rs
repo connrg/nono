@@ -213,11 +213,11 @@ fn prompt_profile_name(suggested: Option<&str>) -> Result<Option<String>> {
             continue;
         }
 
-        if would_shadow_builtin(candidate) {
+        if would_shadow_existing_profile(candidate) {
             prompt_println(&format!(
                 "{}",
                 format!(
-                    "Cannot save '{}' as a user profile because it would shadow the built-in profile of the same name. Choose a different name.",
+                    "Cannot save '{}' as a user profile because it would shadow an existing built-in or pack profile of the same name. Choose a different name.",
                     candidate
                 )
                 .red()
@@ -325,7 +325,7 @@ fn suggested_run_profile_name(compared_profile: Option<&str>, cmd_name: &str) ->
     }
 
     let candidate = profile_name_from_command(cmd_name)?;
-    if would_shadow_builtin(&candidate) {
+    if would_shadow_existing_profile(&candidate) {
         return None;
     }
 
@@ -370,21 +370,30 @@ fn profile_name_from_command(cmd_name: &str) -> Option<String> {
 }
 
 /// Return true when writing `~/.config/nono/profiles/<name>.json` would shadow
-/// a built-in profile of the same name. User files are loaded in preference to
-/// built-ins, so saving under a built-in's name silently reroutes all future
-/// `--profile <name>` invocations to the user file.
-fn would_shadow_builtin(profile_name: &str) -> bool {
+/// a built-in or installed pack profile of the same name. User files are loaded
+/// in preference to built-ins and pack-store profiles, so saving under an
+/// existing profile's name silently reroutes all future `--profile <name>`
+/// invocations to the user file and intercepts any `"extends": "<name>"` chains.
+pub(crate) fn would_shadow_existing_profile(profile_name: &str) -> bool {
     // If a user file already exists at this name, the user has already chosen
     // to override it — writing there is an explicit update, not a new shadow.
     if profile::is_user_override(profile_name) {
         return false;
     }
+    // Check embedded built-in profiles first.
     match crate::policy::load_embedded_policy() {
-        Ok(policy) => policy.profiles.contains_key(profile_name),
+        Ok(policy) => {
+            if policy.profiles.contains_key(profile_name) {
+                return true;
+            }
+        }
         // Treat load failure as fail-safe: refuse to save rather than risk
         // silently shadowing a built-in we couldn't enumerate.
-        Err(_) => true,
+        Err(_) => return true,
     }
+    // Check pack-store profiles. A user profile with the same name would
+    // shadow the pack profile and break any "extends": "<name>" chains.
+    profile::find_pack_store_profile(profile_name).is_some()
 }
 
 pub(crate) fn write_profile(prepared: &PreparedProfileSave) -> Result<()> {
@@ -1401,6 +1410,46 @@ mod tests {
     }
 
     #[test]
+    fn suggested_run_profile_name_avoids_shadowing_pack_profile() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        // Set up a fake pack store with a profile named "hermes".
+        let pack_dir = temp_config
+            .path()
+            .join("nono")
+            .join("packages")
+            .join("test-ns")
+            .join("test-pack");
+        std::fs::create_dir_all(pack_dir.join("profiles")).expect("mkdir pack");
+        let manifest = r#"{
+            "schema_version": 1,
+            "name": "test-pack",
+            "artifacts": [
+                {"type": "profile", "path": "profiles/hermes.json", "install_as": "hermes"}
+            ]
+        }"#;
+        std::fs::write(pack_dir.join("package.json"), manifest).expect("write manifest");
+        std::fs::write(
+            pack_dir.join("profiles").join("hermes.json"),
+            "{\"meta\":{\"name\":\"hermes\",\"version\":\"1.0.0\"}}\n",
+        )
+        .expect("write pack profile");
+
+        // The command name "hermes" collides with the installed pack profile,
+        // so no suggestion should be offered.
+        assert_eq!(suggested_run_profile_name(None, "hermes"), None);
+    }
+
+    #[test]
     fn prompt_line_uses_crlf_for_terminal_layout() {
         assert_eq!(
             prompt_line("[nono] Paths to be saved as grants:"),
@@ -1519,7 +1568,7 @@ mod tests {
     }
 
     #[test]
-    fn would_shadow_builtin_flags_known_builtin_names() {
+    fn would_shadow_existing_profile_flags_known_builtin_names() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
@@ -1531,15 +1580,57 @@ mod tests {
             ),
         ]);
 
-        // `codex` is a known built-in; writing to that user path would
-        // shadow it.
-        assert!(would_shadow_builtin("opencode"));
-        // Names that don't exist as built-ins are fine.
-        assert!(!would_shadow_builtin("my-unique-saved-profile"));
+        // `opencode` is a known built-in; writing to that user path would shadow it.
+        assert!(would_shadow_existing_profile("opencode"));
+        // Names that don't exist as built-ins or pack profiles are fine.
+        assert!(!would_shadow_existing_profile("my-unique-saved-profile"));
     }
 
     #[test]
-    fn would_shadow_builtin_allows_update_of_existing_user_override() {
+    fn would_shadow_existing_profile_flags_installed_pack_profile() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp_home = TempDir::new().expect("temp home");
+        let temp_config = TempDir::new().expect("temp config");
+        let _env = EnvVarGuard::set_all(&[
+            ("HOME", temp_home.path().to_str().expect("home path")),
+            (
+                "XDG_CONFIG_HOME",
+                temp_config.path().to_str().expect("config path"),
+            ),
+        ]);
+
+        // Set up a fake pack store: $XDG_CONFIG_HOME/nono/packages/test-ns/test-pack/
+        let pack_dir = temp_config
+            .path()
+            .join("nono")
+            .join("packages")
+            .join("test-ns")
+            .join("test-pack");
+        std::fs::create_dir_all(pack_dir.join("profiles")).expect("mkdir pack");
+
+        // Write a minimal package.json that declares a profile artifact with install_as "hermes".
+        let manifest = r#"{
+            "schema_version": 1,
+            "name": "test-pack",
+            "artifacts": [
+                {"type": "profile", "path": "profiles/hermes.json", "install_as": "hermes"}
+            ]
+        }"#;
+        std::fs::write(pack_dir.join("package.json"), manifest).expect("write manifest");
+        std::fs::write(
+            pack_dir.join("profiles").join("hermes.json"),
+            "{\"meta\":{\"name\":\"hermes\",\"version\":\"1.0.0\"}}\n",
+        )
+        .expect("write pack profile");
+
+        // Saving a user profile named "hermes" would shadow the pack profile.
+        assert!(would_shadow_existing_profile("hermes"));
+        // Unrelated names are still fine.
+        assert!(!would_shadow_existing_profile("my-unique-saved-profile"));
+    }
+
+    #[test]
+    fn would_shadow_existing_profile_allows_update_of_existing_user_override() {
         let _env_lock = ENV_LOCK.lock().expect("env lock");
         let temp_home = TempDir::new().expect("temp home");
         let temp_config = TempDir::new().expect("temp config");
@@ -1557,11 +1648,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
         std::fs::write(
             &path,
-            "{\"meta\":{\"name\":\"codex\",\"version\":\"1.0.0\"}}\n",
+            "{\"meta\":{\"name\":\"opencode\",\"version\":\"1.0.0\"}}\n",
         )
         .expect("write");
 
-        assert!(!would_shadow_builtin("opencode"));
+        assert!(!would_shadow_existing_profile("opencode"));
     }
 
     #[test]
