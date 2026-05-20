@@ -22,6 +22,7 @@ mod deprecated_schema;
 mod deprecation_warnings;
 mod exec_strategy;
 mod execution_runtime;
+mod hook_runtime;
 mod instruction_deny;
 mod launch_runtime;
 mod learn;
@@ -255,6 +256,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),
@@ -302,6 +304,7 @@ mod tests {
         let prepared = PreparedSandbox {
             caps: CapabilitySet::new(),
             secrets: Vec::new(),
+            session_hooks: crate::profile::SessionHooks::default(),
             rollback_exclude_patterns: Vec::new(),
             rollback_exclude_globs: Vec::new(),
             network_profile: Some("developer".to_string()),

@@ -1,8 +1,12 @@
 use crate::audit_attestation::prepare_audit_signer;
+use crate::hook_runtime;
 use crate::launch_runtime::{LaunchPlan, select_threading_context};
 use crate::proxy_runtime::start_proxy_runtime;
 use crate::supervised_runtime::{SupervisedRuntimeContext, execute_supervised_runtime};
-use crate::{command_blocking_deprecation, config, exec_strategy, output, sandbox_state};
+use crate::{
+    DETACHED_SESSION_ID_ENV, command_blocking_deprecation, config, exec_strategy, output,
+    sandbox_state, session,
+};
 use nono::undo::{ContentHash, ExecutableIdentity};
 use nono::{CapabilitySet, NonoError, Result, Sandbox};
 use sha2::{Digest, Sha256};
@@ -10,7 +14,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const PROFILE_HINT_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -242,12 +246,54 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
     }
     apply_pre_fork_sandbox(strategy, &caps, flags.silent)?;
 
+    // Session id shared across before- and after-hook so paired setup/teardown
+    // scripts see the same NONO_SESSION_ID. Only allocated when at least one
+    // hook is configured.
+    let hook_session_id: Option<String> =
+        (flags.session_hooks.before.is_some() || flags.session_hooks.after.is_some()).then(|| {
+            std::env::var(DETACHED_SESSION_ID_ENV)
+                .ok()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(session::generate_session_id)
+        });
+
+    // ---- Before-hook execution ----
+    let hook_env_vars_owned: Vec<(String, String)> = flags
+        .session_hooks
+        .before
+        .as_ref()
+        .zip(hook_session_id.as_deref())
+        .map(|(before, session_id)| {
+            match hook_runtime::execute_before_hook(before, session_id, &current_dir) {
+                Ok(env) => {
+                    if !env.is_empty() {
+                        info!(
+                            "Before-hook exported {} env vars (script: {})",
+                            env.len(),
+                            before.script.display()
+                        );
+                    }
+                    env
+                }
+                Err(e) => {
+                    warn!("Before-hook failed (continuing): {e}");
+                    Vec::new()
+                }
+            }
+        })
+        .unwrap_or_default();
+
     let mut env_vars: Vec<(&str, &str)> = loaded_secrets
         .iter()
         .map(|secret| (secret.env_var.as_str(), secret.value.as_str()))
         .collect();
     for (key, value) in &proxy_env_vars {
         env_vars.push((key.as_str(), value.as_str()));
+    }
+
+    // Hook env vars have lowest priority: prepend so secrets and proxy override.
+    for (key, value) in hook_env_vars_owned.iter().rev() {
+        env_vars.insert(0, (key.as_str(), value.as_str()));
     }
 
     let threading = select_threading_context(
@@ -367,6 +413,16 @@ pub(crate) fn execute_sandboxed(plan: LaunchPlan) -> Result<()> {
                 redaction_policy: &flags.redaction_policy,
                 silent: flags.silent,
             })?;
+
+            // ---- After-hook execution ----
+            if let (Some(after), Some(session_id)) = (
+                flags.session_hooks.after.as_ref(),
+                hook_session_id.as_deref(),
+            ) && let Err(e) =
+                hook_runtime::execute_after_hook(after, session_id, &current_dir, exit_code)
+            {
+                warn!("After-hook failed: {e}");
+            }
 
             cleanup_capability_state_file(&cap_file_path);
             drop(config);

@@ -104,6 +104,7 @@ pub(crate) struct ExecutionFlags {
     pub(crate) trust: TrustLaunchOptions,
     pub(crate) proxy: ProxyLaunchOptions,
     pub(crate) redaction_policy: nono::ScrubPolicy,
+    pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) allowed_env_vars: Option<Vec<String>>,
     pub(crate) denied_env_vars: Option<Vec<String>>,
 }
@@ -132,6 +133,7 @@ impl ExecutionFlags {
             },
             proxy: ProxyLaunchOptions::default(),
             redaction_policy: nono::ScrubPolicy::secure_default(),
+            session_hooks: profile::SessionHooks::default(),
             allowed_env_vars: None,
             denied_env_vars: None,
         })
@@ -265,6 +267,7 @@ pub(crate) fn prepare_run_launch_plan(
             trust,
             proxy,
             redaction_policy,
+            session_hooks: prepared.session_hooks,
             allowed_env_vars: prepared.allowed_env_vars,
             denied_env_vars: prepared.denied_env_vars,
         },
