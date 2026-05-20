@@ -55,7 +55,7 @@ pub(crate) fn run_detached_launch(args: RunArgs, silent: bool) -> Result<()> {
     let attach_path = session::session_socket_path(&session_id)?;
     let detach_timeout = args
         .detach_timeout_secs
-        .map(std::time::Duration::from_secs)
+        .map(|secs| std::time::Duration::from_secs(secs.min(3600)))
         .unwrap_or_else(crate::timeouts::detach_startup_timeout);
     let deadline = std::time::Instant::now() + detach_timeout;
     while std::time::Instant::now() < deadline {

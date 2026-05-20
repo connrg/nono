@@ -76,29 +76,35 @@ pub fn pty_drain_timeout() -> Duration {
 /// Read `NONO_PTY_ATTACH_TIMEOUT` (milliseconds). Returns the default when
 /// the variable is absent or unparseable.
 pub fn pty_attach_timeout_ms() -> i32 {
-    match std::env::var("NONO_PTY_ATTACH_TIMEOUT") {
-        Ok(val) => match val.parse::<i32>() {
-            Ok(ms) if ms > 0 => ms,
-            _ => {
-                warn!(
-                    "NONO_PTY_ATTACH_TIMEOUT={val:?} is not a valid positive integer, using default"
-                );
-                PTY_ATTACH_TIMEOUT_MS
-            }
-        },
-        Err(_) => PTY_ATTACH_TIMEOUT_MS,
-    }
+    env_duration_millis(
+        "NONO_PTY_ATTACH_TIMEOUT",
+        Duration::from_millis(PTY_ATTACH_TIMEOUT_MS as u64),
+    )
+    .as_millis()
+    .min(i32::MAX as u128) as i32
 }
 
 /// Default for `wait_for_attach_ready` poll timeout.
 pub const PTY_ATTACH_TIMEOUT_MS: i32 = 1000;
 
+/// Upper bound for any user-supplied timeout. Prevents `Instant + Duration`
+/// overflow from user-controlled values (u64::MAX seconds would panic).
+const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+
 fn env_duration_secs(var: &str, default: Duration) -> Duration {
     match std::env::var(var) {
         Ok(val) => match val.parse::<u64>() {
-            Ok(secs) => Duration::from_secs(secs),
+            Ok(secs) => {
+                let d = Duration::from_secs(secs);
+                if d > MAX_TIMEOUT {
+                    warn!("{var}={val} exceeds maximum ({} s), clamping", MAX_TIMEOUT.as_secs());
+                    MAX_TIMEOUT
+                } else {
+                    d
+                }
+            }
             Err(_) => {
-                warn!("{var}={val:?} is not a valid integer, using default");
+                warn!("{var}={val:?} is not a valid number of seconds, using default");
                 default
             }
         },
@@ -109,9 +115,17 @@ fn env_duration_secs(var: &str, default: Duration) -> Duration {
 fn env_duration_millis(var: &str, default: Duration) -> Duration {
     match std::env::var(var) {
         Ok(val) => match val.parse::<u64>() {
-            Ok(ms) => Duration::from_millis(ms),
+            Ok(ms) => {
+                let d = Duration::from_millis(ms);
+                if d > MAX_TIMEOUT {
+                    warn!("{var}={val} exceeds maximum ({} s), clamping", MAX_TIMEOUT.as_secs());
+                    MAX_TIMEOUT
+                } else {
+                    d
+                }
+            }
             Err(_) => {
-                warn!("{var}={val:?} is not a valid integer, using default");
+                warn!("{var}={val:?} is not a valid number of milliseconds, using default");
                 default
             }
         },
