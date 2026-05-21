@@ -28,13 +28,6 @@
 ---
 </div>
 
-
-<div align="center">
-
-<img src="assets/term.gif" alt="nono terminal demo" width="800"/>
-
-</div>
-
 > [!NOTE]
 > In the lead-up to a 1.0 release, APIs are stabilizing. API changes may still occur where necessary, but will be kept to a minimum.
 
