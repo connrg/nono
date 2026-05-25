@@ -597,7 +597,7 @@ impl SupervisorListener {
         }
 
         stream
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
                     "Failed to set read timeout on accepted connection: {e}"
