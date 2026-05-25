@@ -521,8 +521,6 @@ fn generate_profile(caps: &CapabilitySet) -> Result<String> {
 
     // Allow specific system operations
     profile.push_str("(allow sysctl-read)\n");
-    // JVM on Apple Silicon requires this sysctl write to query CPU translation state
-    profile.push_str("(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))\n");
 
     // Mach IPC: allow service resolution. Deny Keychain/security services by default.
     // If a keychain DB is explicitly granted, skip these denies so profiles that

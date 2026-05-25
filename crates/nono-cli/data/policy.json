@@ -417,7 +417,6 @@
       "description": "Java runtime and build tool paths (SDKMAN, Maven, Gradle)",
       "allow": {
         "read": [
-          "/usr/lib/jvm",
           "~/.sdkman",
           "~/.m2/repository",
           "~/.m2/wrapper",
@@ -801,6 +800,9 @@
       "security": {
         "signal_mode": "isolated"
       },
+      "unsafe_macos_seatbelt_rules": [
+        "(allow sysctl-write (sysctl-name \"kern.grade_cputype\"))"
+      ],
       "filesystem": {},
       "network": { "block": false, "network_profile": "developer" },
       "workdir": { "access": "readwrite" },
