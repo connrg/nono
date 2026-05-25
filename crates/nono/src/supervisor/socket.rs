@@ -541,18 +541,20 @@ impl SupervisorListener {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o700);
-            std::fs::set_permissions(path, perms).map_err(|e| {
-                NonoError::SandboxInit(format!(
+            if let Err(e) = std::fs::set_permissions(path, perms) {
+                let _ = std::fs::remove_file(path);
+                return Err(NonoError::SandboxInit(format!(
                     "Failed to set supervisor listener permissions: {e}"
-                ))
-            })?;
+                )));
+            }
         }
 
-        listener.set_nonblocking(true).map_err(|e| {
-            NonoError::SandboxInit(format!(
+        if let Err(e) = listener.set_nonblocking(true) {
+            let _ = std::fs::remove_file(path);
+            return Err(NonoError::SandboxInit(format!(
                 "Failed to set supervisor listener to non-blocking: {e}"
-            ))
-        })?;
+            )));
+        }
 
         Ok(Self {
             listener,
@@ -595,7 +597,7 @@ impl SupervisorListener {
         }
 
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
             .map_err(|e| {
                 NonoError::SandboxInit(format!(
                     "Failed to set read timeout on accepted connection: {e}"

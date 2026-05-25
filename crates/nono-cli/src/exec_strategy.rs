@@ -534,9 +534,7 @@ pub fn execute_supervised(
     // `/usr/bin/open`. Seatbelt blocks that from launching URLs. Instead, we
     // create a shim script named `open` in a temp directory and prepend it to
     // PATH so the npm `open` package hits our shim first.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut url_listener: Option<(SupervisorListener, tempfile::TempDir)> = None;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     let mut url_listener_socket_path: Option<std::path::PathBuf> = None;
 
     if supervisor.is_some()

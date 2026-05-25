@@ -18,6 +18,7 @@ pub(crate) fn run_open_url_helper(args: OpenUrlHelperArgs) -> Result<()> {
     })?;
 
     let mut socket = SupervisorSocket::connect(Path::new(&socket_path))?;
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
 
     let request = UrlOpenRequest {
         request_id: format!("url-{}", std::process::id()),
