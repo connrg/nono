@@ -466,13 +466,14 @@ fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
     // before trusting it, so a stale or spoofed $PWD is ignored.
     let canonical_cwd = std::env::current_dir().ok();
 
-    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from) {
-        if pwd.is_absolute() {
-            let pwd_canonical = pwd.canonicalize().ok();
-            if pwd_canonical.is_some() && pwd_canonical == canonical_cwd {
-                return pwd;
-            }
-        }
+    if let Some(pwd) = std::env::var_os("PWD").map(PathBuf::from)
+        && pwd.is_absolute()
+        && let Ok(pwd_canonical) = pwd.canonicalize()
+        && canonical_cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd == &pwd_canonical)
+    {
+        return pwd;
     }
 
     canonical_cwd.unwrap_or_else(|| PathBuf::from("."))
@@ -1283,15 +1284,13 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // deduplicate() preserves symlink originals when merging, so adding this cap
     // on top of an existing profile cap is safe.
     #[cfg(target_os = "macos")]
-    if let Ok(cwd_canonical) = workdir.canonicalize() {
-        if cwd_canonical != workdir {
-            if let Some(access) = cwd_access_requirement(profile_workdir_access.as_ref()) {
-                if let Ok(cap) = FsCapability::new_dir(&workdir, access) {
-                    caps.add_fs(cap);
-                    caps.deduplicate();
-                }
-            }
-        }
+    if let Ok(cwd_canonical) = workdir.canonicalize()
+        && cwd_canonical != workdir
+        && let Some(access) = cwd_access_requirement(profile_workdir_access.as_ref())
+        && let Ok(cap) = FsCapability::new_dir(&workdir, access)
+    {
+        caps.add_fs(cap);
+        caps.deduplicate();
     }
 
     // Re-validate against the full deny set (groups + profile add_deny_access)
