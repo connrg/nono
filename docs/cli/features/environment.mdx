@@ -131,6 +131,8 @@ This strips `GITHUB_TOKEN`, `GITHUB_ACTIONS`, any var starting with `ANTHROPIC_`
 
 Use `set_vars` to inject environment variables with specific values into the sandboxed process. This is the inverse of filtering: instead of controlling which inherited variables pass through, you define explicit values.
 
+**Availability:** `set_vars` requires nono **v0.63.0 or later**. On earlier versions the profile fails to load with an `unknown field set_vars` error — upgrade nono rather than treating it as a typo.
+
 ```json
 {
   "environment": {
