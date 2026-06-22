@@ -43,6 +43,12 @@ From here **fork the config**, tweak it, theme it, make it your own, and share i
 
 ## Quickstart
 
+#### curl
+
+```bash
+curl -fsSL https://nono.sh/install.sh | sh
+```
+
 #### macOS / Linux (Homebrew)
 ```bash
 brew install nono
