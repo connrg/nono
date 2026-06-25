@@ -3498,4 +3498,44 @@ mod tests {
         assert!(summary.contains("file"));
         assert!(summary.contains("dir"));
     }
+
+    // ---- #1102 additions: resource-limit builder ----
+
+    #[test]
+    fn capabilityset_with_and_get_resource_limits_roundtrip() {
+        use crate::resource::ResourceLimits;
+
+        let caps = CapabilitySet::new();
+        assert!(
+            caps.resource_limits().is_none(),
+            "a fresh set has no limits"
+        );
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(512 * 1024 * 1024),
+        };
+        let caps = caps.with_resource_limits(limits);
+        let got = caps.resource_limits().expect("limits attached");
+        assert_eq!(*got, limits);
+        assert_eq!(got.memory_bytes, Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn with_resource_limits_last_call_wins() {
+        use crate::resource::ResourceLimits;
+
+        // The builder overwrites rather than merges: the final call's ceiling is
+        // the one that sticks (Option assignment, not accumulation).
+        let caps = CapabilitySet::new()
+            .with_resource_limits(ResourceLimits {
+                memory_bytes: Some(1024),
+            })
+            .with_resource_limits(ResourceLimits {
+                memory_bytes: Some(2048),
+            });
+        assert_eq!(
+            caps.resource_limits().and_then(|l| l.memory_bytes),
+            Some(2048)
+        );
+    }
 }

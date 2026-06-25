@@ -2,7 +2,7 @@
 //!
 //! # What this does, in plain terms
 //!
-//! When a sandboxed run is given a `--memory` (or `--max-procs`) limit, this
+//! When a sandboxed run is given a `--memory` limit, this
 //! module puts the program in a kernel-enforced "box" so it cannot use more than
 //! that. If it tries, the Linux kernel kills it instantly — and *only* it — so a
 //! runaway agent cannot drag down the rest of the machine. Think of a room with
@@ -51,21 +51,17 @@
 //!
 //! # The knobs we set
 //!
-//! Mirrors the by-hand proof at `~/alwaysfurther/cgroup-spike/` (the fixture this
-//! is graded against):
+//! These three knobs match the manual cgroup v2 experiment that validated the
+//! design:
 //! - `memory.max`         — the hard memory ceiling; cross it and the kernel OOM-kills.
 //! - `memory.swap.max=0`  — forbid spilling to swap, which would let it dodge the ceiling.
 //! - `memory.oom.group=1` — on OOM, kill the *whole* box at once, not one random member.
-//! - `cpu.max`            — cap CPU *bandwidth* (a share of the cores) so a
-//!   runaway can spin forever but never starve the host; a rate limit, not a
-//!   cumulative CPU-seconds budget.
-//! - `pids.max`           — cap the number of processes (stops a fork bomb).
 //!
 //! We deliberately do **not** set `memory.high` (a softer "ease off" threshold):
 //! with swap forbidden, a runaway allocator has nothing to reclaim, so it would
 //! stall for many seconds before finally being killed — defeating the point of a
-//! fast, clean kill. (Design open question #2: revisit as an opt-in for genuine
-//! near-limit workloads if there is data showing it helps.)
+//! fast, clean kill. (Revisit as an opt-in only if real near-limit workloads
+//! show it helps.)
 //!
 //! Choosing *which* backend to enforce with (the WSL2 / non-systemd probe and
 //! the `auto`/`cgroup`/`portable` resolution) is a later step; this targets the
@@ -139,9 +135,10 @@ impl CgroupLeaf {
     fn arm(path: PathBuf, limits: &ResourceLimits) -> Result<Self> {
         write_knobs(&path, limits)?;
         let procs_path = path.join("cgroup.procs");
-        // O_CLOEXEC (Rust's default) is intentional: the fd is inherited across
-        // `fork` so the child can self-attach, then closes automatically at the
-        // child's `execve`.
+        // Close-on-exec (`O_CLOEXEC`, Rust's default) is intentional: the fd is
+        // inherited across `fork` so the child can self-attach, then the kernel
+        // closes it automatically at the child's `execve` — so it never leaks
+        // into the sandboxed program.
         let procs = OpenOptions::new()
             .write(true)
             .open(&procs_path)
@@ -211,10 +208,9 @@ const MAX_PID_DIGITS: usize = 10;
 /// returning the populated trailing slice. A non-positive `pid` is defensively
 /// rendered as `"0"` (which a real pid never is).
 fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
-    // A real pid is always positive; clamp anything else to 0 defensively.
     let mut n = u32::try_from(pid).unwrap_or(0);
-    // Fill the buffer back-to-front (least-significant digit first), then return
-    // the populated trailing slice.
+    // Write digits least-significant-first into the tail of buf, so we never
+    // need a second pass to reverse them (keeps this branch- and alloc-light).
     let mut i = buf.len();
     if n == 0 {
         i -= 1;
@@ -240,31 +236,7 @@ fn write_knobs(path: &Path, limits: &ResourceLimits) -> Result<()> {
         // No memory.high on purpose — see the module docs: with swap forbidden
         // it stalls a runaway allocator instead of killing it.
     }
-    if let Some(percent) = limits.cpu_max_percent {
-        write_knob(path, "cpu.max", &cpu_max_knob_value(percent))?;
-    }
-    if let Some(procs) = limits.max_procs {
-        write_knob(path, "pids.max", &procs.to_string())?;
-    }
     Ok(())
-}
-
-/// cgroup v2 `cpu.max` period, in microseconds. A 100 ms period is the kernel
-/// default and keeps the quota arithmetic exact for whole-percent limits.
-const PERIOD_US: u64 = 100_000;
-
-/// Render a percent-of-one-core limit to a cgroup v2 `cpu.max` value.
-///
-/// `cpu.max` is `"<quota_us> <period_us>"`: the cgroup may use at most `quota_us`
-/// microseconds of CPU per `period_us`. With the fixed [`PERIOD_US`] period,
-/// percent-of-one-core maps to `quota = percent * (PERIOD_US / 100)`
-/// (`100%` → `100000 100000` = one full core; `150%` → `150000 100000` = one and
-/// a half cores; `50%` → `50000 100000` = half a core). This caps the *rate*, so
-/// a runaway can spin forever but never starve the host. `saturating_mul` keeps
-/// an absurd percent from wrapping; the kernel rejects nonsense quotas regardless.
-fn cpu_max_knob_value(percent: u64) -> String {
-    let quota_us = percent.saturating_mul(PERIOD_US / 100);
-    format!("{quota_us} {PERIOD_US}")
 }
 
 fn write_knob(path: &Path, knob: &str, value: &str) -> Result<()> {
@@ -278,6 +250,13 @@ fn write_knob(path: &Path, knob: &str, value: &str) -> Result<()> {
     })
 }
 
+/// How long to wait for the kernel to reap killed members before `rmdir`:
+/// [`REAP_POLL_ATTEMPTS`] checks, [`REAP_POLL_INTERVAL`] apart — a ~500ms ceiling.
+/// In the common case (the child has already exited) the first check passes and
+/// we never sleep.
+const REAP_POLL_ATTEMPTS: u32 = 50;
+const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// Kill anything still in the leaf, then remove it. Best-effort: leaking an
 /// empty cgroup directory is not worth failing a completed run over.
 fn teardown(path: &Path) {
@@ -285,12 +264,12 @@ fn teardown(path: &Path) {
     // unavailable; for a reaped single process the leaf is already empty.
     let _ = fs::write(path.join("cgroup.kill"), "1");
     // A cgroup with live members cannot be removed; wait briefly for the kernel
-    // to reap before rmdir.
+    // to reap before rmdir (see the poll-budget consts above).
     let procs = path.join("cgroup.procs");
-    for _ in 0..50 {
+    for _ in 0..REAP_POLL_ATTEMPTS {
         match fs::read_to_string(&procs) {
             Ok(contents) if contents.trim().is_empty() => break,
-            Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+            Ok(_) => std::thread::sleep(REAP_POLL_INTERVAL),
             Err(_) => break,
         }
     }
@@ -357,9 +336,10 @@ fn parse_delegated_base(proc_self_cgroup: &str, uid: u32) -> Result<PathBuf> {
     Ok(acc)
 }
 
-/// Verify the delegation pushed the controllers we need into its children
-/// (`cgroup.subtree_control`); without that the leaf's `memory.max`/`pids.max`
-/// files would not exist and a cap would silently fail to apply.
+/// Verify the controllers we need are enabled for child cgroups. A cgroup only
+/// exposes a controller's knobs (here `memory.max`) if that controller is listed
+/// in the parent's `cgroup.subtree_control` file; without that the leaf's
+/// `memory.max` would not exist and a cap would silently fail to apply.
 fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<()> {
     let subtree_path = base.join("cgroup.subtree_control");
     let subtree = fs::read_to_string(&subtree_path).map_err(|e| {
@@ -378,40 +358,13 @@ fn ensure_controllers_delegated(base: &Path, limits: &ResourceLimits) -> Result<
             subtree.trim()
         )));
     }
-    if limits.cpu_max_percent.is_some() && !has("cpu") {
-        return Err(NonoError::SandboxInit(format!(
-            "resource: the 'cpu' controller is not delegated to {} \
-             (cgroup.subtree_control = '{}'); cannot enforce --cpu-max",
-            base.display(),
-            subtree.trim()
-        )));
-    }
-    if limits.max_procs.is_some() && !has("pids") {
-        return Err(NonoError::SandboxInit(format!(
-            "resource: the 'pids' controller is not delegated to {} \
-             (cgroup.subtree_control = '{}'); cannot enforce --max-procs",
-            base.display(),
-            subtree.trim()
-        )));
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_PID_DIGITS, cpu_max_knob_value, format_pid_decimal, parse_delegated_base};
+    use super::{MAX_PID_DIGITS, format_pid_decimal, parse_delegated_base};
     use std::path::PathBuf;
-
-    /// The percent-of-one-core limit must render to the exact cgroup `cpu.max`
-    /// "<quota> <period>" the kernel expects, against a fixed 100ms period.
-    #[test]
-    fn cpu_max_value_maps_percent_to_quota_over_period() {
-        assert_eq!(cpu_max_knob_value(100), "100000 100000"); // one full core
-        assert_eq!(cpu_max_knob_value(50), "50000 100000"); // half a core
-        assert_eq!(cpu_max_knob_value(150), "150000 100000"); // one and a half cores
-        assert_eq!(cpu_max_knob_value(200), "200000 100000"); // two cores
-        assert_eq!(cpu_max_knob_value(1), "1000 100000"); // 1% of a core
-    }
 
     #[test]
     fn parses_user_service_ancestor_from_deep_path() {
@@ -471,5 +424,405 @@ mod tests {
         let mut buf = [0u8; MAX_PID_DIGITS];
         assert_eq!(format_pid_decimal(0, &mut buf), b"0");
         assert_eq!(format_pid_decimal(-1, &mut buf), b"0");
+    }
+
+    // ---- #1102 additions: adversarial component-wise matching & pid property ----
+
+    /// SECURITY: the delegation boundary is matched by whole path SEGMENT
+    /// (`segment == marker`), never by substring. A `starts_with`/`contains`
+    /// implementation would false-match these crafted near-miss segments and
+    /// hand an attacker a base outside the real `user@<uid>.service` delegation
+    /// (AGENTS.md: string `starts_with` on paths is a vulnerability). Every one
+    /// of these must be REJECTED for uid 1000 (no exact-segment match).
+    #[test]
+    fn rejects_adversarial_segment_lookalikes_componentwise() {
+        let poisoned = [
+            // marker with a trailing suffix on the same segment (prefix match)
+            "0::/user.slice/user-1000.slice/user@1000.service.evil/app.slice\n",
+            "0::/user.slice/user-1000.slice/user@1000.serviceX\n",
+            // marker as a strict SUFFIX of a single segment
+            "0::/user.slice/user-1000.slice/xuser@1000.service/app.slice\n",
+            "0::/user.slice/user-1000.slice/evil-user@1000.service\n",
+            // marker embedded mid-segment (would be caught by `contains`)
+            "0::/user.slice/prefixuser@1000.servicesuffix/app.slice\n",
+            // dot/underscore confusable that is NOT a path separator
+            "0::/user.slice/user@1000_service\n",
+            // a stray space welds trailing junk onto the marker segment; split('/')
+            // does not break on spaces, so the segment is "user@1000.service junk".
+            "0::/user.slice/user@1000.service junk/app.scope\n",
+        ];
+        for raw in poisoned {
+            assert!(
+                parse_delegated_base(raw, 1000).is_err(),
+                "adversarial lookalike segment must NOT match the delegation boundary: {raw:?}"
+            );
+        }
+    }
+
+    /// SECURITY: the uid is baked into the marker (`user@<uid>.service`) and must
+    /// match a whole segment. uid 100's marker `user@100.service` must NOT match
+    /// a `user@1000.service` segment (100 is a substring of 1000), and vice versa.
+    #[test]
+    fn rejects_uid_that_is_substring_of_another_uid() {
+        // Path delegates uid 1000; asking as uid 100 (a substring) must fail.
+        let raw_1000 = "0::/user.slice/user-1000.slice/user@1000.service/app.slice\n";
+        assert!(
+            parse_delegated_base(raw_1000, 100).is_err(),
+            "uid 100 must not borrow uid 1000's delegation (substring match)"
+        );
+        // Symmetric: path delegates uid 100; asking as uid 1000 must fail.
+        let raw_100 = "0::/user.slice/user-100.slice/user@100.service/app.slice\n";
+        assert!(
+            parse_delegated_base(raw_100, 1000).is_err(),
+            "uid 1000 must not match uid 100's delegation"
+        );
+        // Exact uid still works (guards against the test over-rejecting).
+        let base = parse_delegated_base(raw_1000, 1000).expect("exact uid must match");
+        assert_eq!(
+            base,
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service")
+        );
+    }
+
+    /// The marker can sit at an interior position with descendants below it; the
+    /// returned base must be truncated to exactly the marker (the delegation
+    /// boundary), discarding everything below — even with a trailing slash and a
+    /// non-first `0::` line.
+    #[test]
+    fn parses_marker_as_nonfinal_segment_and_truncates_exactly() {
+        let raw = "1:name=systemd:/legacy/ignored\n\
+                   0::/user.slice/user-1000.slice/user@1000.service/app.slice/svc.scope\n";
+        let base = parse_delegated_base(raw, 1000).expect("should parse");
+        assert_eq!(
+            base,
+            PathBuf::from("/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"),
+            "base must stop at the marker even with descendants below it"
+        );
+
+        // Trailing slash after the marker: split('/').filter(non-empty) drops the
+        // empty tail, so the result is identical.
+        let raw_slash = "0::/user.slice/user@1000.service/\n";
+        let base_slash = parse_delegated_base(raw_slash, 1000).expect("should parse");
+        assert_eq!(
+            base_slash,
+            PathBuf::from("/sys/fs/cgroup/user.slice/user@1000.service")
+        );
+    }
+
+    /// `format_pid_decimal` is async-signal-safe and load-bearing (the post-fork
+    /// child writes its pid through it to self-attach). It must equal the
+    /// allocating `i32::to_string()` for every positive pid, including the
+    /// boundaries that exercise digit-count transitions and the EXACT buffer fill
+    /// at `i32::MAX` (10 digits == MAX_PID_DIGITS). Asserting against `to_string`
+    /// uses std as an independent oracle rather than hand-computed literals.
+    #[test]
+    fn format_pid_decimal_matches_to_string_over_wide_range_and_boundaries() {
+        let mut buf = [0u8; MAX_PID_DIGITS];
+
+        // Explicit boundaries: digit-count transitions + exact buffer fill.
+        for &pid in &[
+            1i32,
+            9,
+            10,
+            99,
+            100,
+            999,
+            1000,
+            9999,
+            10000,
+            1_000_000,
+            i32::MAX,
+        ] {
+            assert_eq!(
+                format_pid_decimal(pid, &mut buf),
+                pid.to_string().as_bytes(),
+                "pid {pid} must encode identically to to_string()"
+            );
+        }
+        // i32::MAX fills the buffer exactly: 10 digits, no leading slack.
+        assert_eq!(format_pid_decimal(i32::MAX, &mut buf).len(), MAX_PID_DIGITS);
+
+        // Dense sweep over a contiguous low range (covers the 9->10, 99->100,
+        // 999->1000 width transitions).
+        for pid in 1..=10_000_i32 {
+            assert_eq!(
+                format_pid_decimal(pid, &mut buf),
+                pid.to_string().as_bytes(),
+                "mismatch at pid {pid}"
+            );
+        }
+        // Wide property sweep across the positive i32 range (a prime stride avoids
+        // aliasing to round numbers while staying fast).
+        let mut pid: i64 = 1;
+        while pid <= i32::MAX as i64 {
+            let p = pid as i32;
+            assert_eq!(format_pid_decimal(p, &mut buf), p.to_string().as_bytes());
+            pid += 7919;
+        }
+
+        // Non-positive defensively renders as "0" (a real pid never is); i32::MIN
+        // is included because a naive `pid.abs()` would overflow/panic.
+        for pid in [0_i32, -1, -42, -2_147_483_647, i32::MIN] {
+            assert_eq!(
+                format_pid_decimal(pid, &mut buf),
+                b"0",
+                "non-positive pid {pid} must render as 0"
+            );
+        }
+    }
+
+    // ---- #1102 LIVE cgroup v2 enforcement tests ----
+    //
+    // These are #[ignore]-gated: they create real cgroup leaves under
+    // /sys/fs/cgroup, run a bounded memory bomb, and read kernel knobs. They are
+    // NOT run by default CI. The host they target must be a systemd
+    // `Delegate=yes` user session with the `memory` controller delegated to
+    // `user@<uid>.service` (cgroup v2 unified hierarchy). Run all of them with:
+    //
+    //   cargo test -p nono-cli --bins -- --ignored
+    //
+    // or one at a time, e.g.:
+    //
+    //   cargo test -p nono-cli --bins -- --ignored live_child_over_memory_cap
+
+    /// LIVE: end-to-end enforcement. A forked child that self-attaches and then
+    /// allocates past the cap is OOM-killed (SIGKILL); the leaf records
+    /// oom_kill>=1; swap stayed at 0 (no escape); the parent survives; and
+    /// drop/teardown removes the leaf. This is the actual security property of
+    /// #1102, proven against a real cgroupfs.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
+    fn live_child_over_memory_cap_is_oom_killed_and_only_it() {
+        use super::CgroupLeaf;
+        use super::child_self_attach;
+        use nix::libc;
+        use nix::sys::signal::Signal;
+        use nix::sys::wait::{WaitStatus, waitpid};
+        use nix::unistd::{ForkResult, fork};
+        use nono::ResourceLimits;
+
+        const CAP: u64 = 64 * 1024 * 1024; // 64 MiB hard ceiling
+        const TOUCH: usize = 128 * 1024 * 1024; // mmap + fault in 128 MiB (2x cap)
+        const PAGE: usize = 4096;
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(CAP),
+        };
+        // Real pre-fork construction: creates the leaf dir, writes
+        // memory.swap.max=0 / memory.max=CAP / memory.oom.group=1, opens
+        // cgroup.procs for the child to inherit.
+        let leaf = CgroupLeaf::create(&limits).expect("create leaf on delegated host");
+        let procs_fd = leaf.procs_raw_fd();
+        let leaf_path = leaf.path.clone(); // private field — reachable in-module
+
+        // SAFETY: single-purpose forked child; after fork it uses only
+        // async-signal-safe libc calls (no Rust heap alloc, no locks) — exactly
+        // the constraint child_self_attach is built for.
+        match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                // Self-attach FIRST, before allocating, mirroring the supervisor.
+                if !child_self_attach(procs_fd) {
+                    unsafe { libc::_exit(126) };
+                }
+                // Allocate anonymous memory and fault one byte per page so the
+                // kernel actually charges it to memory.current.
+                let addr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        TOUCH,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                if addr == libc::MAP_FAILED {
+                    unsafe { libc::_exit(50) };
+                }
+                let base = addr.cast::<u8>();
+                let mut off = 0usize;
+                while off < TOUCH {
+                    // Touch the page; the kernel OOM-kills us (SIGKILL) the moment
+                    // resident memory crosses CAP, so this loop never completes.
+                    unsafe { *base.add(off) = 0xA5 };
+                    off += PAGE;
+                }
+                // If we somehow survive the cap, exit 0 so the parent's SIGKILL
+                // assertion FAILS loudly (the cap did not enforce).
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                let status = waitpid(child, None).expect("waitpid");
+                // The child must be KILLED by the kernel, not exit cleanly.
+                match status {
+                    WaitStatus::Signaled(_, Signal::SIGKILL, _) => {}
+                    other => {
+                        panic!("expected child SIGKILL (OOM), got {other:?}; cap did not enforce")
+                    }
+                }
+
+                // Kernel-side evidence: the leaf recorded an OOM kill.
+                let events = std::fs::read_to_string(leaf_path.join("memory.events"))
+                    .expect("read memory.events");
+                let oom_kill = events
+                    .lines()
+                    .find_map(|l| l.strip_prefix("oom_kill "))
+                    .and_then(|n| n.trim().parse::<u64>().ok())
+                    .expect("memory.events has an oom_kill line");
+                assert!(
+                    oom_kill >= 1,
+                    "expected oom_kill>=1 in memory.events, got {oom_kill} (full: {events:?})"
+                );
+
+                // The swap escape hatch stayed shut: nothing spilled to swap.
+                let swap = std::fs::read_to_string(leaf_path.join("memory.swap.current"))
+                    .expect("read memory.swap.current");
+                assert_eq!(
+                    swap.trim(),
+                    "0",
+                    "memory.swap.current must be 0 (swap.max=0 forbids the escape)"
+                );
+                // Reaching here at all proves the parent survived the child OOM
+                // kill: oom.group scoped the kill to the leaf, not this process.
+            }
+        }
+
+        // Drop runs teardown: kill survivors, rmdir the leaf.
+        drop(leaf);
+        // Fail-closed cleanup is observable: the leaf directory is gone.
+        assert!(
+            !leaf_path.exists(),
+            "leaf {} must be removed after teardown",
+            leaf_path.display()
+        );
+    }
+
+    /// LIVE: leak-free lifecycle. create() materializes exactly one leaf directly
+    /// under the delegated base with memory.max set to the requested cap, and
+    /// Drop/teardown removes it.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
+    fn live_teardown_removes_leaf_and_create_leaves_no_leak() {
+        use super::CgroupLeaf;
+        use super::delegated_base;
+        use nono::ResourceLimits;
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        };
+        let base = delegated_base().expect("delegated base on delegated host");
+
+        let leaf = CgroupLeaf::create(&limits).expect("create leaf");
+        let leaf_path = leaf.path.clone(); // private field — in-module access
+        assert!(
+            leaf_path.is_dir(),
+            "create() must produce a real leaf dir at {}",
+            leaf_path.display()
+        );
+        // The leaf lives directly under the delegated base.
+        assert_eq!(
+            leaf_path.parent(),
+            Some(base.as_path()),
+            "leaf must be a child of the delegated base"
+        );
+        // memory.max knob actually took (controller delegated, knob written). A
+        // page-multiple value is echoed back verbatim by the kernel.
+        let max = std::fs::read_to_string(leaf_path.join("memory.max")).expect("read memory.max");
+        assert_eq!(max.trim(), (64u64 * 1024 * 1024).to_string());
+
+        drop(leaf); // teardown: rmdir
+        assert!(
+            !leaf_path.exists(),
+            "teardown must remove the leaf dir {}",
+            leaf_path.display()
+        );
+    }
+
+    /// LIVE: fail-closed against a colliding leaf. create() does fs::create_dir
+    /// BEFORE arm(), and a leftover leaf with our exact pid is a hard error
+    /// (no silent adoption of stale members). With the dir pre-planted, create()
+    /// returns Err on EEXIST and must NOT tear down a directory it did not create.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
+    fn live_create_failure_leaves_no_partial_leaf() {
+        use super::CgroupLeaf;
+        use super::{delegated_base, teardown};
+        use nono::ResourceLimits;
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        };
+        let base = delegated_base().expect("delegated base");
+        // Plant a directory with our exact future leaf name so create()'s
+        // fs::create_dir hits EEXIST and must error.
+        let collide = base.join(format!("nono.{}", std::process::id()));
+        std::fs::create_dir(&collide).expect("plant colliding leaf");
+
+        let result = CgroupLeaf::create(&limits);
+        assert!(
+            result.is_err(),
+            "create() must refuse an already-existing leaf (no silent adoption)"
+        );
+        // The planted directory is OURS: create() errored on EEXIST before arm(),
+        // so it must not have torn down a directory it did not create.
+        assert!(
+            collide.is_dir(),
+            "create() must not delete a pre-existing collision it did not own"
+        );
+        // Clean up our planted dir via the module's own teardown.
+        teardown(&collide);
+        assert!(!collide.exists(), "cleanup of planted leaf failed");
+    }
+
+    /// LIVE: the self-attach MECHANISM (not just pid formatting). A forked child
+    /// that calls child_self_attach through the inherited cgroup.procs fd actually
+    /// appears in the leaf's cgroup.procs. No bomb — the child just parks.
+    #[test]
+    #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
+    fn live_child_self_attach_lands_pid_in_leaf_procs() {
+        use super::CgroupLeaf;
+        use super::child_self_attach;
+        use nix::libc;
+        use nix::sys::wait::waitpid;
+        use nix::unistd::{ForkResult, fork};
+        use nono::ResourceLimits;
+
+        let limits = ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        };
+        let leaf = CgroupLeaf::create(&limits).expect("create leaf");
+        let procs_fd = leaf.procs_raw_fd();
+        let leaf_path = leaf.path.clone();
+
+        // SAFETY: child uses only async-signal-safe libc calls post-fork.
+        match unsafe { fork() }.expect("fork") {
+            ForkResult::Child => {
+                let ok = child_self_attach(procs_fd);
+                if !ok {
+                    unsafe { libc::_exit(126) };
+                }
+                // Park ~300ms so the parent can read cgroup.procs while we live.
+                unsafe { libc::usleep(300_000) };
+                unsafe { libc::_exit(0) };
+            }
+            ForkResult::Parent { child } => {
+                // Give the child a beat to self-attach.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let procs = std::fs::read_to_string(leaf_path.join("cgroup.procs"))
+                    .expect("read leaf cgroup.procs");
+                let child_pid = child.as_raw();
+                let present = procs
+                    .lines()
+                    .filter_map(|l| l.trim().parse::<i32>().ok())
+                    .any(|p| p == child_pid);
+                assert!(
+                    present,
+                    "child pid {child_pid} must appear in leaf cgroup.procs (got {procs:?})"
+                );
+                let _ = waitpid(child, None);
+            }
+        }
+        drop(leaf);
+        assert!(!leaf_path.exists(), "leaf removed after teardown");
     }
 }

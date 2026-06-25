@@ -579,20 +579,11 @@ fn finalize_prepared_sandbox(
     // (clap `conflicts_with`), so this only fires on the flag path. Enforcement
     // happens later in the supervised runtime (issue #1102); here we just attach
     // the parsed limits to the capability set (also shown in `--dry-run`).
-    if args.memory.is_some() || args.cpu_max.is_some() || args.max_procs.is_some() {
-        let memory_bytes = match args.memory {
-            Some(ref s) => Some(nono::resource::parse_size(s)?),
-            None => None,
-        };
-        let cpu_max_percent = match args.cpu_max {
-            Some(ref s) => Some(nono::resource::parse_cpu_max(s)?),
-            None => None,
-        };
-        prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
-            memory_bytes,
-            cpu_max_percent,
-            max_procs: args.max_procs,
-        });
+    if let Some(ref s) = args.memory {
+        let memory_bytes = Some(nono::resource::parse_size(s)?);
+        prepared.caps = prepared
+            .caps
+            .with_resource_limits(nono::ResourceLimits { memory_bytes });
     }
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);

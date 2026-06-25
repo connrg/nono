@@ -50,7 +50,7 @@ impl CapabilityManifest {
     ///
     /// Checks for:
     /// - `rollback.enabled` requires `exec_strategy: "supervised"`
-    /// - `resources` (memory_bytes/cpu_max_percent/max_procs) require `exec_strategy: "supervised"`
+    /// - `resources` (memory_bytes) require `exec_strategy: "supervised"`
     /// - URI manager credential sources require `env_var`
     /// - `url_path` inject mode requires `path_pattern`
     /// - `query_param` inject mode requires `query_param_name`
@@ -76,9 +76,7 @@ impl CapabilityManifest {
         // require exec_strategy: "supervised". A bare `backend` with no actual
         // limit is a no-op and does not trigger the requirement.
         if let Some(ref res) = self.resources
-            && (res.memory_bytes.is_some()
-                || res.cpu_max_percent.is_some()
-                || res.max_procs.is_some())
+            && res.memory_bytes.is_some()
         {
             let exec_strategy = self
                 .process
@@ -86,7 +84,7 @@ impl CapabilityManifest {
                 .map_or(ExecStrategy::Monitor, |p| p.exec_strategy);
             if exec_strategy != ExecStrategy::Supervised {
                 return Err(crate::NonoError::ConfigParse(
-                    "resources (memory_bytes/cpu_max_percent/max_procs) require \
+                    "resources (memory_bytes) require \
                      exec_strategy: \"supervised\" \
                      (limits are enforced by the supervising parent process)"
                         .to_string(),
@@ -146,13 +144,11 @@ mod resource_tests {
         let json = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "supervised" },
-            "resources": { "memory_bytes": 536870912, "cpu_max_percent": 150, "max_procs": 64 }
+            "resources": { "memory_bytes": 536870912 }
         }"#;
         let manifest = CapabilityManifest::from_json(json).expect("parse");
         let res = manifest.resources.as_ref().expect("resources present");
         assert_eq!(res.memory_bytes.map(|n| n.get()), Some(536870912));
-        assert_eq!(res.cpu_max_percent.map(|n| n.get()), Some(150));
-        assert_eq!(res.max_procs.map(|n| n.get()), Some(64));
         manifest.validate().expect("valid: supervised");
 
         // Re-serialize and re-parse to confirm the field round-trips.
@@ -184,18 +180,10 @@ mod resource_tests {
         let json = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "monitor" },
-            "resources": { "max_procs": 8 }
+            "resources": { "memory_bytes": 1024 }
         }"#;
         let manifest = CapabilityManifest::from_json(json).expect("parse");
         assert!(manifest.validate().is_err());
-
-        // A cpu-only limit equally requires supervised.
-        let json = r#"{ "version": "0.1.0", "resources": { "cpu_max_percent": 50 } }"#;
-        let manifest = CapabilityManifest::from_json(json).expect("parse");
-        assert!(
-            manifest.validate().is_err(),
-            "cpu_max_percent without supervised must fail validation"
-        );
     }
 
     #[test]
@@ -205,6 +193,96 @@ mod resource_tests {
         assert!(
             CapabilityManifest::from_json(json).is_err(),
             "a misspelled resource key must be a hard error, not silently dropped"
+        );
+    }
+
+    // ---- #1102 additions: memory-only schema contract ----
+
+    #[test]
+    fn resources_rejects_removed_cpu_and_procs_keys() {
+        // The memory-only contract: cpu_max_percent and max_procs were removed from
+        // the Resources schema. Because Resources is additionalProperties:false
+        // (generated as #[serde(deny_unknown_fields)]), a manifest still carrying
+        // either must fail to PARSE — proving the removal is enforced by the schema,
+        // not silently ignored at runtime.
+        let with_cpu = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 1024, "cpu_max_percent": 50 }
+        }"#;
+        assert!(
+            CapabilityManifest::from_json(with_cpu).is_err(),
+            "cpu_max_percent was removed; a manifest carrying it must fail to parse"
+        );
+
+        let with_procs = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 1024, "max_procs": 10 }
+        }"#;
+        assert!(
+            CapabilityManifest::from_json(with_procs).is_err(),
+            "max_procs was removed; a manifest carrying it must fail to parse"
+        );
+
+        // Even as the sole resource key (no valid memory_bytes to anchor on).
+        let cpu_only = r#"{ "version": "0.1.0", "resources": { "cpu_max_percent": 50 } }"#;
+        assert!(
+            CapabilityManifest::from_json(cpu_only).is_err(),
+            "a removed key as the only resource must still be rejected"
+        );
+    }
+
+    #[test]
+    fn resources_unknown_key_alongside_valid_memory_fails_whole_manifest() {
+        // A correct memory_bytes does not rescue an unknown sibling key: the whole
+        // manifest must fail (additionalProperties:false / deny_unknown_fields on
+        // Resources). This guards against a typo'd limit being silently dropped
+        // while the rest of the manifest is accepted.
+        let json = r#"{
+            "version": "0.1.0",
+            "process": { "exec_strategy": "supervised" },
+            "resources": { "memory_bytes": 536870912, "totally_bogus": true }
+        }"#;
+        assert!(
+            CapabilityManifest::from_json(json).is_err(),
+            "unknown sibling of a valid memory_bytes must fail the whole manifest"
+        );
+    }
+
+    #[test]
+    fn resources_rejects_zero_and_negative_memory_via_schema_minimum() {
+        // schema minimum:1 is generated as Option<NonZeroU64>, so a zero or negative
+        // ceiling fails at parse time — a limit of 0 can never be mistaken for
+        // "unlimited", and a negative number can never fit an unsigned ceiling.
+        let zero = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 0 } }"#;
+        assert!(
+            CapabilityManifest::from_json(zero).is_err(),
+            "memory_bytes: 0 violates minimum:1 (NonZeroU64) and must fail to parse"
+        );
+
+        let negative = r#"{ "version": "0.1.0", "resources": { "memory_bytes": -1 } }"#;
+        assert!(
+            CapabilityManifest::from_json(negative).is_err(),
+            "negative memory_bytes cannot fit an unsigned ceiling and must fail to parse"
+        );
+    }
+
+    #[test]
+    fn validate_memory_unsupervised_yields_configparse_variant() {
+        // memory_bytes present + default (monitor) strategy: validate() must reject
+        // specifically via the public NonoError::ConfigParse variant (the same error
+        // surface the CLI relies on for a clean message). The reject/accept/no-op
+        // behaviour itself is covered by resources_require_supervised /
+        // empty_resources_is_a_noop; this pins the variant.
+        let unsupervised = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 1024 } }"#;
+        let manifest = CapabilityManifest::from_json(unsupervised).expect("parse");
+        let err = manifest
+            .validate()
+            .expect_err("memory limit without supervised must be rejected");
+        assert!(
+            matches!(err, crate::NonoError::ConfigParse(_)),
+            "expected ConfigParse, got {err:?}"
         );
     }
 }

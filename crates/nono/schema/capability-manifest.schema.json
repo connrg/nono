@@ -365,17 +365,7 @@
         "memory_bytes": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum resident memory for the process tree, in bytes. Enforced via cgroup memory.max together with memory.swap.max=0."
-        },
-        "cpu_max_percent": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum CPU bandwidth for the process tree, as a percentage of a single CPU core (100 = one full core, 150 = one and a half cores, 50 = half a core). A rate cap, not a cumulative CPU-seconds budget. Enforced via cgroup cpu.max with a fixed 100ms period."
-        },
-        "max_procs": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Maximum number of processes/threads allowed in the tree. Enforced via cgroup pids.max."
+          "description": "Maximum resident memory for the process tree, in bytes. Enforced via cgroup memory.max together with memory.swap.max=0 and memory.oom.group=1."
         }
       }
     }

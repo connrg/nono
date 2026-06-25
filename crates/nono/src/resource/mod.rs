@@ -1,8 +1,8 @@
 //! Resource limits — parsed, validated ceilings for a sandboxed process tree.
 //!
-//! This is the internal, enforcement-facing representation, mirroring how
-//! [`crate::capability::CapabilitySet`] is the internal type while the
-//! schema-generated [`crate::manifest`] types are the on-disk contract.
+//! This is the internal, enforcement-facing type; the schema-generated
+//! [`crate::manifest`] types are the on-disk contract. (Same split as
+//! [`crate::capability::CapabilitySet`] vs the manifest.)
 //!
 //! Scope note (issue #1102): this module defines the limits and parses them
 //! from human-friendly CLI input; the configuration, serialization, and
@@ -20,19 +20,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Maximum resident memory for the process tree, in bytes
-    /// (cgroup `memory.max` + `memory.swap.max=0`).
+    /// (cgroup `memory.max` + `memory.swap.max=0` + `memory.oom.group=1`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_bytes: Option<u64>,
-    /// Maximum CPU bandwidth for the process tree, as a percentage of a single
-    /// CPU core: `100` is one full core, `150` is one and a half cores, `50` is
-    /// half a core (cgroup `cpu.max` with a fixed 100 ms period). This is a
-    /// *rate* cap (a share of CPU), not a cumulative CPU-seconds budget — a
-    /// throttled process may run indefinitely but can never starve the host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu_max_percent: Option<u64>,
-    /// Maximum number of processes/threads in the tree (cgroup `pids.max`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_procs: Option<u64>,
 }
 
 impl ResourceLimits {
@@ -40,7 +30,7 @@ impl ResourceLimits {
     /// worth displaying or requiring a supervised run.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.memory_bytes.is_none() && self.cpu_max_percent.is_none() && self.max_procs.is_none()
+        self.memory_bytes.is_none()
     }
 
     /// One-line human-readable summary for `--dry-run` / capability output.
@@ -49,13 +39,7 @@ impl ResourceLimits {
         let mem = self
             .memory_bytes
             .map_or_else(|| "unlimited".to_string(), format_bytes);
-        let cpu = self
-            .cpu_max_percent
-            .map_or_else(|| "unlimited".to_string(), |p| format!("{p}%"));
-        let procs = self
-            .max_procs
-            .map_or_else(|| "unlimited".to_string(), |n| n.to_string());
-        format!("memory={mem} cpu={cpu} max-procs={procs}")
+        format!("memory={mem}")
     }
 }
 
@@ -116,71 +100,6 @@ pub fn parse_size(input: &str) -> Result<u64> {
     Ok(bytes)
 }
 
-/// Parse a CPU bandwidth limit into a percentage of a single core.
-///
-/// Two notations are accepted:
-/// - a percentage with a trailing `%` — `50%` → `50`, `200%` → `200`;
-/// - a (possibly fractional) number of cores — `1.5` → `150`, `2` → `200`,
-///   `0.5` → `50`.
-///
-/// The result is "percent of one core", so `100` means one full core. This is
-/// the value stored in [`ResourceLimits::cpu_max_percent`] and later rendered to
-/// the cgroup `cpu.max` knob.
-///
-/// Returns [`NonoError::ConfigParse`] on an empty string, a non-numeric value, a
-/// non-finite or non-positive number of cores, or a result of zero (a limit of
-/// zero is rejected rather than silently meaning "unlimited").
-pub fn parse_cpu_max(input: &str) -> Result<u64> {
-    let s = input.trim();
-    if s.is_empty() {
-        return Err(NonoError::ConfigParse(
-            "cpu limit cannot be empty".to_string(),
-        ));
-    }
-
-    if let Some(percent_str) = s.strip_suffix('%') {
-        // Percent notation: a whole-number percentage of one core.
-        let percent_str = percent_str.trim();
-        let percent: u64 = percent_str.parse().map_err(|_| {
-            NonoError::ConfigParse(format!(
-                "invalid cpu limit '{input}': '{percent_str}' is not a whole percentage \
-                 (e.g. 50% for half a core)"
-            ))
-        })?;
-        if percent == 0 {
-            return Err(NonoError::ConfigParse(format!(
-                "cpu limit '{input}' must be greater than zero"
-            )));
-        }
-        return Ok(percent);
-    }
-
-    // Cores notation: a possibly-fractional number of cores (e.g. 1.5).
-    let cores: f64 = s.parse().map_err(|_| {
-        NonoError::ConfigParse(format!(
-            "invalid cpu limit '{input}': use a percentage like '50%' or a number of \
-             cores like '1.5'"
-        ))
-    })?;
-    if !cores.is_finite() || cores <= 0.0 {
-        return Err(NonoError::ConfigParse(format!(
-            "cpu limit '{input}' must be a positive number of cores"
-        )));
-    }
-    // Cores → percent of one core. Round to the nearest whole percent; reject
-    // anything that rounds down to zero (smaller than 1% of a core).
-    let percent = (cores * 100.0).round();
-    if percent < 1.0 {
-        return Err(NonoError::ConfigParse(format!(
-            "cpu limit '{input}' is too small (the minimum is 0.01 cores, i.e. 1%)"
-        )));
-    }
-    // `percent` is finite and >= 1.0 here; the saturating f64→u64 cast cannot
-    // wrap, and a value beyond u64 range is an absurd core count we clamp.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    Ok(percent as u64)
-}
-
 /// Format a byte count with binary units for display (e.g. `512.0 MiB`).
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
@@ -193,6 +112,7 @@ fn format_bytes(bytes: u64) -> String {
         idx += 1;
     }
     if idx == 0 {
+        // Under 1 KiB the loop never advanced: print whole bytes, no decimal.
         format!("{bytes} B")
     } else {
         format!("{val:.1} {}", UNITS[idx])
@@ -247,79 +167,234 @@ mod tests {
     }
 
     #[test]
-    fn parse_cpu_max_percentage_notation() {
-        assert_eq!(parse_cpu_max("50%").unwrap(), 50);
-        assert_eq!(parse_cpu_max("100%").unwrap(), 100);
-        assert_eq!(parse_cpu_max("200%").unwrap(), 200);
-        assert_eq!(parse_cpu_max("  75%  ").unwrap(), 75);
-    }
-
-    #[test]
-    fn parse_cpu_max_cores_notation() {
-        assert_eq!(parse_cpu_max("1").unwrap(), 100);
-        assert_eq!(parse_cpu_max("2").unwrap(), 200);
-        assert_eq!(parse_cpu_max("1.5").unwrap(), 150);
-        assert_eq!(parse_cpu_max("0.5").unwrap(), 50);
-        assert_eq!(parse_cpu_max("0.25").unwrap(), 25);
-    }
-
-    #[test]
-    fn parse_cpu_max_rejects_bad_input() {
-        assert!(parse_cpu_max("").is_err());
-        assert!(parse_cpu_max("abc").is_err());
-        assert!(parse_cpu_max("%").is_err());
-        assert!(
-            parse_cpu_max("0%").is_err(),
-            "zero percent must be rejected"
-        );
-        assert!(parse_cpu_max("0").is_err(), "zero cores must be rejected");
-        assert!(
-            parse_cpu_max("0.001").is_err(),
-            "below 1% must be rejected, not silently rounded to zero"
-        );
-        assert!(
-            parse_cpu_max("-1").is_err(),
-            "negative cores must be rejected"
-        );
-        assert!(
-            parse_cpu_max("1.5%").is_err(),
-            "fractional percent is not a whole percentage"
-        );
-    }
-
-    #[test]
     fn limits_is_empty_and_summary() {
         let none = ResourceLimits::default();
         assert!(none.is_empty());
 
         let some = ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
-            cpu_max_percent: Some(150),
-            max_procs: Some(64),
         };
         assert!(!some.is_empty());
         let s = some.summary();
-        assert!(s.contains("512.0 MiB"), "got: {s}");
-        assert!(s.contains("cpu=150%"), "got: {s}");
-        assert!(s.contains("max-procs=64"), "got: {s}");
+        assert_eq!(s, "memory=512.0 MiB");
 
-        // A cpu-only limit is still non-empty (so it routes to a supervised run).
-        let cpu_only = ResourceLimits {
-            cpu_max_percent: Some(50),
-            ..ResourceLimits::default()
-        };
-        assert!(!cpu_only.is_empty());
+        let unset = ResourceLimits::default();
+        assert_eq!(unset.summary(), "memory=unlimited");
     }
 
     #[test]
     fn limits_serde_roundtrip() {
         let limits = ResourceLimits {
             memory_bytes: Some(1024),
-            cpu_max_percent: Some(50),
-            max_procs: None,
         };
         let json = serde_json::to_string(&limits).unwrap();
         let back: ResourceLimits = serde_json::from_str(&json).unwrap();
         assert_eq!(limits, back);
+    }
+
+    // ---- #1102 additions: pure-function correctness & serde contract ----
+
+    #[test]
+    fn parse_size_zero_forms_and_leading_chars() {
+        // Every spelling that evaluates to zero must be rejected: a zero limit is
+        // refused rather than silently meaning "unlimited".
+        assert!(parse_size("0").is_err());
+        assert!(parse_size("00").is_err());
+        assert!(parse_size("000").is_err());
+        assert!(parse_size("0B").is_err());
+        assert!(parse_size("0K").is_err());
+        assert!(parse_size("000K").is_err());
+
+        // A leading '+' is not an ASCII digit, so digits_end is 0 and the numeric
+        // part is empty -> rejected as a missing numeric value (NOT parsed as +5).
+        assert!(parse_size("+5").is_err());
+
+        // Leading zeros on a non-zero value are accepted (u64 parse ignores them).
+        assert_eq!(parse_size("007").unwrap(), 7);
+        assert_eq!(parse_size("0007K").unwrap(), 7 * 1024);
+    }
+
+    #[test]
+    fn parse_size_unit_overflow_boundaries_per_unit() {
+        // For each multiplier, the largest value that still fits in u64 must parse,
+        // and the next integer up must be rejected as overflow. This pins the
+        // checked_mul boundary exactly rather than just "some huge value fails".
+
+        // K / Ki / KiB multiplier = 1024. u64::MAX / 1024 = 18014398509481983.
+        assert_eq!(
+            parse_size("18014398509481983K").unwrap(),
+            18_014_398_509_481_983_u64 * 1024
+        );
+        assert!(parse_size("18014398509481984K").is_err());
+
+        // KB multiplier = 1000. u64::MAX / 1000 = 18446744073709551.
+        assert_eq!(
+            parse_size("18446744073709551KB").unwrap(),
+            18_446_744_073_709_551_u64 * 1000
+        );
+        assert!(parse_size("18446744073709552KB").is_err());
+
+        // T / Ti / TiB multiplier = 1024^4 = 1099511627776.
+        // u64::MAX / 1099511627776 = 16777215.
+        assert_eq!(
+            parse_size("16777215T").unwrap(),
+            16_777_215_u64 * 1024_u64.pow(4)
+        );
+        assert!(parse_size("16777216T").is_err());
+
+        // Bare bytes have multiplier 1: u64::MAX itself fits, nothing overflows.
+        assert_eq!(parse_size("18446744073709551615").unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn parse_size_unit_distinctions_and_internal_whitespace() {
+        // Decimal vs binary kilobyte must be distinct, asserted side by side.
+        assert_eq!(parse_size("1KB").unwrap(), 1000);
+        assert_eq!(parse_size("1KiB").unwrap(), 1024);
+        assert_eq!(parse_size("1K").unwrap(), 1024);
+        assert_eq!(parse_size("1Ki").unwrap(), 1024);
+        // ...and the same one-step-up distinction for M.
+        assert_eq!(parse_size("1MB").unwrap(), 1_000_000);
+        assert_eq!(parse_size("1MiB").unwrap(), 1024 * 1024);
+
+        // Whitespace BETWEEN the number and the unit is tolerated, because the
+        // unit is trimmed before matching: "1 K" -> unit " K" -> "k" -> 1024.
+        assert_eq!(parse_size("1 K").unwrap(), 1024);
+        assert_eq!(parse_size("512 MiB").unwrap(), 512 * 1024 * 1024);
+
+        // But a SECOND run of digits after a space is part of the unit, which then
+        // fails to match any known unit -> rejected (not silently truncated).
+        assert!(parse_size("5 12").is_err());
+        assert!(parse_size("1 2K").is_err());
+    }
+
+    #[test]
+    fn format_bytes_via_summary_exact_boundaries() {
+        // format_bytes is private; exercise it through ResourceLimits::summary(),
+        // which prepends "memory=". Pin the exact rendering at the unit boundaries,
+        // the sub-KiB whole-byte branch, a TiB value, the unit cap, and a rounding
+        // case.
+        let mem = |b: u64| {
+            ResourceLimits {
+                memory_bytes: Some(b),
+            }
+            .summary()
+        };
+
+        // Under 1 KiB: whole bytes, no decimal, ' B' suffix.
+        assert_eq!(mem(1), "memory=1 B");
+        assert_eq!(mem(1023), "memory=1023 B");
+        // Exactly 1 KiB: switches to one-decimal binary unit.
+        assert_eq!(mem(1024), "memory=1.0 KiB");
+        // Half a KiB above 1 KiB.
+        assert_eq!(mem(1536), "memory=1.5 KiB");
+        // 1587 / 1024 = 1.5498 -> rounds to one decimal as 1.5.
+        assert_eq!(mem(1587), "memory=1.5 KiB");
+        // 1100 / 1024 = 1.0742 -> rounds to 1.1.
+        assert_eq!(mem(1100), "memory=1.1 KiB");
+        // Exact MiB / GiB.
+        assert_eq!(mem(1024 * 1024), "memory=1.0 MiB");
+        assert_eq!(mem(1024 * 1024 * 1024), "memory=1.0 GiB");
+        // Exact TiB (1024^4).
+        assert_eq!(mem(1024_u64.pow(4)), "memory=1.0 TiB");
+        assert_eq!(mem(1024_u64.pow(4) + 1024_u64.pow(4) / 2), "memory=1.5 TiB");
+        // 1 PiB has no PiB unit: the loop caps at TiB, so it reads as 1024.0 TiB.
+        assert_eq!(mem(1024_u64.pow(5)), "memory=1024.0 TiB");
+    }
+
+    #[test]
+    fn parse_size_format_bytes_roundtrip_on_exact_binary_values() {
+        // For values that are an exact, single-unit binary multiple, summary()'s
+        // rendered form re-parses (via parse_size) back to the same byte count:
+        // a closed loop proving the human-facing units and the parser agree.
+        for (bytes, unit) in [
+            (1024_u64, "KiB"),
+            (512 * 1024, "KiB"),
+            (1024 * 1024, "MiB"),
+            (512 * 1024 * 1024, "MiB"),
+            (1024 * 1024 * 1024, "GiB"),
+            (1024_u64.pow(4), "TiB"),
+        ] {
+            // summary renders e.g. "memory=1.0 KiB"; strip the prefix and the ".0"
+            // to reconstruct the integer+unit the parser accepts.
+            let summary = ResourceLimits {
+                memory_bytes: Some(bytes),
+            }
+            .summary();
+            let rendered = summary.strip_prefix("memory=").unwrap();
+            let (value, suffix) = rendered.split_once(' ').unwrap();
+            assert_eq!(suffix, unit, "unexpected unit for {bytes}");
+            // The integer magnitude in the rendered "<n>.0" form, re-attached to
+            // the unit, must parse straight back to the original byte count.
+            let int_part = value.strip_suffix(".0").unwrap();
+            let reparsed = parse_size(&format!("{int_part}{unit}")).unwrap();
+            assert_eq!(reparsed, bytes, "round-trip failed for {bytes}");
+        }
+    }
+
+    #[test]
+    fn is_empty_tracks_memory_field_and_summary_unlimited() {
+        // is_empty is exactly memory_bytes.is_none(); summary reflects the same.
+        let empty = ResourceLimits { memory_bytes: None };
+        assert!(empty.is_empty());
+        assert_eq!(empty.summary(), "memory=unlimited");
+
+        // Even a 1-byte limit makes it non-empty and is rendered, not elided.
+        let set = ResourceLimits {
+            memory_bytes: Some(1),
+        };
+        assert!(!set.is_empty());
+        assert_eq!(set.summary(), "memory=1 B");
+
+        // Default is the unlimited/empty state.
+        assert!(ResourceLimits::default().is_empty());
+    }
+
+    #[test]
+    fn none_memory_serializes_to_empty_object_with_no_key() {
+        // skip_serializing_if = "Option::is_none": a None ceiling must produce an
+        // empty JSON object, not `{"memory_bytes":null}`. This is the on-disk
+        // contract that keeps legacy/None states forward-compatible.
+        let none = ResourceLimits::default();
+        assert_eq!(serde_json::to_string(&none).unwrap(), "{}");
+
+        let v: serde_json::Value = serde_json::to_value(none).unwrap();
+        let obj = v.as_object().expect("serializes to a JSON object");
+        assert!(obj.is_empty(), "None must emit no keys, got {obj:?}");
+        assert!(!obj.contains_key("memory_bytes"));
+    }
+
+    #[test]
+    fn empty_and_null_object_deserialize_to_none() {
+        // The inverse of the skip-serialize contract: an absent field (`{}`) and an
+        // explicit `null` both deserialize back to None via #[serde(default)], so a
+        // state written by an older build round-trips cleanly.
+        let from_empty: ResourceLimits = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.memory_bytes.is_none());
+        assert!(from_empty.is_empty());
+
+        let from_null: ResourceLimits = serde_json::from_str(r#"{"memory_bytes":null}"#).unwrap();
+        assert!(from_null.memory_bytes.is_none());
+    }
+
+    #[test]
+    fn some_memory_serializes_with_exactly_one_key_and_roundtrips() {
+        // Some(N) must serialize to exactly { "memory_bytes": N } — one key, the
+        // right value — and survive a round-trip. (The existing roundtrip test
+        // would still pass if a stray key leaked in, since serde ignores unknown
+        // fields on the way back; this pins the exact serialized shape.)
+        let some = ResourceLimits {
+            memory_bytes: Some(536_870_912),
+        };
+        let v: serde_json::Value = serde_json::to_value(some).unwrap();
+        let obj = v.as_object().expect("object");
+        assert_eq!(obj.len(), 1, "exactly one serialized key, got {obj:?}");
+        assert_eq!(
+            obj.get("memory_bytes").and_then(serde_json::Value::as_u64),
+            Some(536_870_912)
+        );
+
+        let back: ResourceLimits = serde_json::from_value(v).unwrap();
+        assert_eq!(back, some);
     }
 }

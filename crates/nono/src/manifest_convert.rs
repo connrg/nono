@@ -102,8 +102,6 @@ impl TryFrom<&CapabilityManifest> for CapabilitySet {
 fn convert_resources(res: &Resources) -> ResourceLimits {
     ResourceLimits {
         memory_bytes: res.memory_bytes.map(|n| n.get()),
-        cpu_max_percent: res.cpu_max_percent.map(|n| n.get()),
-        max_procs: res.max_procs.map(|n| n.get()),
     }
 }
 
@@ -148,14 +146,12 @@ mod tests {
         let json = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "supervised" },
-            "resources": { "memory_bytes": 1048576, "cpu_max_percent": 150, "max_procs": 32 }
+            "resources": { "memory_bytes": 1048576 }
         }"#;
         let manifest = CapabilityManifest::from_json(json).unwrap();
         let caps = CapabilitySet::try_from(&manifest).unwrap();
         let limits = caps.resource_limits().expect("limits present");
         assert_eq!(limits.memory_bytes, Some(1048576));
-        assert_eq!(limits.cpu_max_percent, Some(150));
-        assert_eq!(limits.max_procs, Some(32));
     }
 
     #[test]
@@ -164,5 +160,36 @@ mod tests {
         let manifest = CapabilityManifest::from_json(json).unwrap();
         let caps = CapabilitySet::try_from(&manifest).unwrap();
         assert!(caps.resource_limits().is_none());
+    }
+
+    // ---- #1102 additions: TryFrom enforces validate(); empty resources maps clean ----
+
+    #[test]
+    fn try_from_runs_validate_and_rejects_unsupervised_memory() {
+        // CapabilitySet::try_from(&manifest) calls manifest.validate() first, so a
+        // memory ceiling under the default (monitor) strategy must surface the same
+        // ConfigParse rather than silently building an unenforceable set.
+        let json = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 1024 } }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let err = CapabilitySet::try_from(&manifest)
+            .expect_err("unsupervised memory limit must be rejected by TryFrom");
+        assert!(matches!(err, NonoError::ConfigParse(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_resources_object_maps_to_no_ceiling() {
+        // `resources: {}` is present-but-empty: the conversion still attaches a
+        // ResourceLimits, but it must carry no ceiling (is_empty), never a phantom
+        // limit. Distinct from manifest_without_resources_has_no_limits, which omits
+        // the resources key entirely.
+        let json = r#"{ "version": "0.1.0", "resources": {} }"#;
+        let manifest = CapabilityManifest::from_json(json).unwrap();
+        let caps = CapabilitySet::try_from(&manifest).unwrap();
+        if let Some(limits) = caps.resource_limits() {
+            assert!(
+                limits.is_empty(),
+                "empty resources must not produce a ceiling, got {limits:?}"
+            );
+        }
     }
 }

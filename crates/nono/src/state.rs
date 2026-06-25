@@ -215,8 +215,6 @@ mod tests {
 
         let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
             memory_bytes: Some(512 * 1024 * 1024),
-            cpu_max_percent: Some(150),
-            max_procs: Some(64),
         });
         let state = SandboxState::from_caps(&caps);
         assert_eq!(
@@ -228,8 +226,6 @@ mod tests {
         let restored = SandboxState::from_json(&json).expect("deserialize state");
         let limits = restored.resource_limits.expect("limits survive roundtrip");
         assert_eq!(limits.memory_bytes, Some(512 * 1024 * 1024));
-        assert_eq!(limits.cpu_max_percent, Some(150));
-        assert_eq!(limits.max_procs, Some(64));
 
         // And back into a CapabilitySet.
         let caps2 = restored.to_caps().expect("to_caps");
@@ -242,6 +238,66 @@ mod tests {
         let json = r#"{ "fs": [], "net_blocked": false }"#;
         let state = SandboxState::from_json(json).expect("legacy state");
         assert!(state.resource_limits.is_none());
+    }
+
+    // ---- #1102 additions: on-disk shape & backward-compat ----
+
+    #[test]
+    fn state_without_limits_omits_resource_limits_key() {
+        let caps = CapabilitySet::new().block_network();
+        let state = SandboxState::from_caps(&caps);
+        assert!(state.resource_limits.is_none());
+
+        // skip_serializing_if on the field: no limits => the key is absent in JSON,
+        // which is exactly what a legacy reader expects to NOT find.
+        let json = state.to_json().expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("resource_limits"),
+            "with no limits the resource_limits key must be omitted, got {obj:?}"
+        );
+    }
+
+    #[test]
+    fn state_with_limits_serializes_inner_value() {
+        use crate::resource::ResourceLimits;
+
+        let caps = CapabilitySet::new()
+            .block_network()
+            .with_resource_limits(ResourceLimits {
+                memory_bytes: Some(256 * 1024 * 1024),
+            });
+        let state = SandboxState::from_caps(&caps);
+
+        // The serialized state must nest the exact memory_bytes value at
+        // resource_limits.memory_bytes (the existing roundtrip test checks the
+        // value survives; this pins the on-disk JSON shape).
+        let json = state.to_json().expect("serialize");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let inner = v
+            .get("resource_limits")
+            .and_then(|r| r.get("memory_bytes"))
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(inner, Some(256 * 1024 * 1024));
+    }
+
+    #[test]
+    fn legacy_state_defaults_resource_limits_and_unix_sockets() {
+        // A pre-#1102 state JSON has neither resource_limits nor unix_sockets.
+        // #[serde(default)] on both must fill them in (None / empty) without error
+        // — this is the backward-compat guarantee for states on disk from older
+        // nono builds.
+        let json = r#"{ "fs": [], "net_blocked": true }"#;
+        let state = SandboxState::from_json(json).expect("legacy state loads");
+        assert!(state.resource_limits.is_none(), "absent field -> None");
+        assert!(state.unix_sockets.is_empty(), "absent field -> empty vec");
+        assert!(state.net_blocked);
+
+        // Explicit null is equivalent to absent for the Option field.
+        let json_null = r#"{ "fs": [], "net_blocked": false, "resource_limits": null }"#;
+        let state_null = SandboxState::from_json(json_null).expect("null limits load");
+        assert!(state_null.resource_limits.is_none());
     }
 
     #[test]
