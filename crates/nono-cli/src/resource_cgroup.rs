@@ -2,56 +2,49 @@
 //!
 //! # What this does
 //!
-//! Given a `--memory` limit, this module puts the run in a kernel-enforced box
-//! it cannot grow past. Cross the line and the kernel kills the box instantly —
-//! and *only* it — so a runaway agent cannot drag down the machine.
+//! Given a `--memory` limit, this puts the run in a kernel-enforced box it cannot
+//! grow past: cross the line and the kernel kills the box instantly, and *only*
+//! it, so a runaway agent cannot drag down the machine.
 //!
-//! The mechanism is **cgroup v2** ("control groups"), the kernel feature
-//! containers use. A cgroup is a directory under `/sys/fs/cgroup`: you set limits
-//! by writing numbers into files inside it (its "knobs"), and you put a process
-//! in it by writing the pid into its `cgroup.procs`. We create one such directory
-//! per run (a "leaf"), set the knobs, the child moves *itself* in, and we delete
-//! it when the run ends. The unsandboxed *supervisor* (nono's parent) builds and
-//! arms the leaf before forking; the sandboxed *child* then attaches itself (see
-//! the race below).
+//! The box is a **cgroup v2** leaf — a directory under `/sys/fs/cgroup` whose
+//! limit "knobs" are files we write. The unsandboxed *supervisor* (nono's parent)
+//! creates and arms the leaf before forking; the sandboxed *child* then puts
+//! itself in it (see the race below); we delete it when the run ends.
 //!
 //! # The race, and why the child self-attaches
 //!
-//! A cgroup caps *every* process in it together, and a forked child inherits its
-//! parent's cgroup — so once a process is in the leaf, its whole subtree is
-//! capped and dies atomically. The hard part is getting the first process *in*
+//! A cgroup caps every process in it together, and a forked child inherits its
+//! parent's cgroup — so once one process is in the leaf, its whole subtree is
+//! capped and dies atomically. The hard part is getting that first process in
 //! without a gap.
 //!
-//! If the parent moved the child in *after* `fork()`, there would be a window
-//! where the child runs but is not yet boxed, and any grandchildren it forks in
-//! that window land in the parent's unconstrained cgroup. So the **child attaches
-//! itself**: the parent opens the leaf's `cgroup.procs` write fd before forking
-//! (the child inherits it), and the child writes its own pid through that fd
-//! before it can fork or exec. It is boxed by construction, no window, regardless
-//! of timing (see [`child_self_attach`]).
+//! If the parent attached the child *after* `fork()`, there would be a window
+//! where the child runs unboxed and could fork grandchildren into the parent's
+//! unconstrained cgroup. So the **child attaches itself**: the parent opens the
+//! leaf's `cgroup.procs` write fd before forking (the child inherits it), and the
+//! child writes its own pid through it before it can fork or exec. Boxed by
+//! construction, no window (see [`child_self_attach`]).
 //!
 //! # Fail-closed (AGENTS.md "Fail Secure")
 //!
 //! If the box cannot be built, armed, or entered, the run is refused:
-//! - Building and arming the box happen *before* fork, so any failure is a
-//!   [`NonoError`] returned while nothing is running yet.
+//! - Building and arming happen *before* fork, so any failure is a [`NonoError`]
+//!   returned while nothing is running yet.
 //! - If the child cannot self-attach, it `_exit(126)`s before applying the
 //!   sandbox or exec'ing — it never runs the thing the limit was meant to cap.
 //!
 //! # The knobs we set
 //!
-//! - `memory.max`         — hard memory ceiling; cross it and the kernel OOM-kills.
+//! - `memory.max`         — hard ceiling; cross it and the kernel OOM-kills.
 //! - `memory.swap.max=0`  — forbid swap, which would let it dodge the ceiling.
 //! - `memory.oom.group=1` — on OOM, kill the *whole* box at once, not one member.
 //!
-//! We deliberately omit `memory.high` (a soft "ease off" threshold): with swap
-//! forbidden a runaway allocator has nothing to reclaim, so it would stall for
-//! seconds before the kill instead of dying fast. (Revisit as opt-in only if a
-//! real near-limit workload shows it helps.)
+//! `memory.high` is omitted on purpose: with swap forbidden a runaway allocator
+//! has nothing to reclaim, so it would stall for seconds instead of dying fast.
 //!
-//! Picking *which* backend to enforce with (the WSL2 / non-systemd probe, the
-//! `auto`/`cgroup`/`portable` resolution) is a later step; this targets the
-//! common case — a systemd `Delegate=yes` user session.
+//! Backend selection (the WSL2 / non-systemd probe, `auto`/`cgroup`/`portable`)
+//! is a later step; this targets the common case — a systemd `Delegate=yes`
+//! session.
 
 use nix::libc;
 use nono::{NonoError, ResourceLimits, Result};
