@@ -477,6 +477,12 @@ pub fn execute_supervised(
     // telling the user two competing stories.
     mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
+    // `resource_procs_fd` is consumed only by the Linux cgroup self-attach path
+    // below; mark it used on other platforms so the strict `-D warnings` build
+    // (macOS) stays clean.
+    #[cfg(not(target_os = "linux"))]
+    let _ = resource_procs_fd;
+
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
 

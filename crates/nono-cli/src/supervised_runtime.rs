@@ -314,7 +314,17 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         // "killed by SIGKILL" footer, which would otherwise send the user
         // chasing path grants for a memory problem.
         #[cfg(target_os = "linux")]
-        let mut on_exit_diag = |_code: i32| -> bool {
+        let mut on_exit_diag = |code: i32| -> bool {
+            // The diagnostic explains the bare SIGKILL the kernel delivers when
+            // the whole sandbox is OOM-killed for crossing the cap (exit code
+            // 128 + SIGKILL = 137). Only look at that exit: a success or an
+            // unrelated failure must not get a spurious "killed by the kernel"
+            // story, nor have its real footer suppressed, just because an
+            // individual descendant was OOM-reaped earlier in the run.
+            const OOM_SIGKILL_EXIT: i32 = 128 + nix::libc::SIGKILL;
+            if code != OOM_SIGKILL_EXIT {
+                return false;
+            }
             match cgroup_leaf.as_ref().and_then(|leaf| leaf.oom_report()) {
                 Some(report) => {
                     crate::output::print_oom_diagnostic(&report, silent);

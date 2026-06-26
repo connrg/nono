@@ -14,7 +14,7 @@ use crate::sandbox_prepare::{
     should_auto_enable_claude_launch_services, validate_external_proxy_bypass,
 };
 use crate::theme;
-use nono::{NonoError, Result};
+use nono::{CapabilitySet, NonoError, Result};
 use std::ffi::OsString;
 use std::path::PathBuf;
 use tracing::warn;
@@ -227,6 +227,26 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
     })
 }
 
+/// `nono wrap` execs the target directly (no supervising parent), so it never
+/// creates the cgroup that enforces a memory ceiling. Accepting a limit here
+/// would run unenforced — or, in `--dry-run`, advertise a cap we won't honor —
+/// which is a silent fail-open of a security control. Refuse instead, the same
+/// stance as the proxy / af_unix guards below. Covers both `--memory` and a
+/// manifest `resources.memory_bytes`, since both have landed in `caps` by now.
+fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
+    if caps
+        .resource_limits()
+        .is_some_and(|limits| !limits.is_empty())
+    {
+        return Err(NonoError::ConfigParse(
+            "nono wrap does not support --memory / resources.memory_bytes because direct \
+             exec cannot create the enforcement cgroup. Use `nono run` instead."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     let args: SandboxArgs = wrap_args.sandbox.into();
     let command = wrap_args.command;
@@ -242,6 +262,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
 
     if args.dry_run {
         let prepared = prepare_sandbox(&args, silent)?;
+        reject_resource_limits_under_wrap(&prepared.caps)?;
         if !prepared.secrets.is_empty() && !silent {
             eprintln!(
                 "  Would inject {} credential(s) as environment variables",
@@ -254,6 +275,7 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
     }
 
     let prepared = prepare_sandbox(&args, silent)?;
+    reject_resource_limits_under_wrap(&prepared.caps)?;
 
     if prepared.upstream_proxy.is_some()
         || matches!(
@@ -302,4 +324,32 @@ pub(crate) fn run_wrap(wrap_args: WrapArgs, silent: bool) -> Result<()> {
             ..ExecutionFlags::defaults(silent)?
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reject_resource_limits_under_wrap;
+    use nono::{CapabilitySet, ResourceLimits};
+
+    #[test]
+    fn wrap_rejects_caps_carrying_a_memory_limit() {
+        // `nono wrap` execs directly and cannot create the enforcement cgroup,
+        // so a requested memory ceiling must be refused (fail-closed) rather than
+        // silently dropped and run unenforced.
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits {
+            memory_bytes: Some(64 * 1024 * 1024),
+        });
+        assert!(reject_resource_limits_under_wrap(&caps).is_err());
+    }
+
+    #[test]
+    fn wrap_allows_caps_without_a_ceiling() {
+        // No limit set at all -> wrap proceeds normally.
+        assert!(reject_resource_limits_under_wrap(&CapabilitySet::new()).is_ok());
+
+        // A present-but-empty limit set carries no ceiling, so it is not a
+        // silently-dropped enforcement request and must be allowed.
+        let caps = CapabilitySet::new().with_resource_limits(ResourceLimits::default());
+        assert!(reject_resource_limits_under_wrap(&caps).is_ok());
+    }
 }
