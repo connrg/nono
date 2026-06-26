@@ -74,12 +74,12 @@ pub fn parse_size(input: &str) -> Result<u64> {
 
     let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1,
-        "k" | "ki" | "kib" => 1024,
-        "kb" => 1000,
-        "m" | "mi" | "mib" => 1024 * 1024,
-        "mb" => 1000 * 1000,
-        "g" | "gi" | "gib" => 1024 * 1024 * 1024,
-        "gb" => 1000 * 1000 * 1000,
+        "k" | "ki" | "kib" => 1024_u64.pow(1),
+        "kb" => 1000_u64.pow(1),
+        "m" | "mi" | "mib" => 1024_u64.pow(2),
+        "mb" => 1000_u64.pow(2),
+        "g" | "gi" | "gib" => 1024_u64.pow(3),
+        "gb" => 1000_u64.pow(3),
         "t" | "ti" | "tib" => 1024_u64.pow(4),
         "tb" => 1000_u64.pow(4),
         other => {

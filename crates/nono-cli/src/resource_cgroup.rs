@@ -175,7 +175,7 @@ impl CgroupLeaf {
         let events = fs::read_to_string(self.path.join("memory.events")).ok()?;
         let oom_kills = event_counter(&events, "oom_kill");
         let oom_group_kills = event_counter(&events, "oom_group_kill");
-        // Nothing was OOM-killed here: the cap was not the cause, so stay quiet.
+        // No OOM kill recorded here: the cap was not the cause, so stay quiet.
         if oom_kills == 0 && oom_group_kills == 0 {
             return None;
         }
@@ -261,8 +261,7 @@ const MAX_PID_DIGITS: usize = 10;
 /// rendered as `"0"` (which a real pid never is).
 fn format_pid_decimal(pid: i32, buf: &mut [u8; MAX_PID_DIGITS]) -> &[u8] {
     let mut n = u32::try_from(pid).unwrap_or(0);
-    // Write digits least-significant-first into the tail of buf, avoiding a
-    // reversal pass.
+    // Emit digits least-significant-first into the tail of buf (no reversal pass).
     let mut i = buf.len();
     if n == 0 {
         i -= 1;
@@ -282,10 +281,10 @@ fn write_knobs(path: &Path, limits: &ResourceLimits) -> Result<()> {
         // Shut the swap escape hatch before setting the ceiling.
         write_knob(path, "memory.swap.max", "0")?;
         write_knob(path, "memory.max", &max.to_string())?;
-        // On OOM, take down the whole box, not one member the kernel picks.
+        // On OOM, take down the whole box at once, not one member the kernel picks.
         write_knob(path, "memory.oom.group", "1")?;
-        // No memory.high on purpose (see module docs): with swap forbidden it
-        // stalls a runaway allocator instead of killing it.
+        // memory.high omitted on purpose (module docs): with swap forbidden it
+        // would stall a runaway allocator instead of killing it fast.
     }
     Ok(())
 }
@@ -319,9 +318,10 @@ fn teardown(path: &Path) {
     let procs = path.join("cgroup.procs");
     for _ in 0..REAP_POLL_ATTEMPTS {
         match fs::read_to_string(&procs) {
-            Ok(contents) if contents.trim().is_empty() => break,
-            Ok(_) => std::thread::sleep(REAP_POLL_INTERVAL),
-            Err(_) => break,
+            // Still occupied: give the kernel a moment to reap, then re-check.
+            Ok(contents) if !contents.trim().is_empty() => std::thread::sleep(REAP_POLL_INTERVAL),
+            // Empty (reaped) or unreadable (already gone): stop waiting and rmdir.
+            _ => break,
         }
     }
     let _ = fs::remove_dir(path);
@@ -397,25 +397,21 @@ fn parse_delegated_base(proc_self_cgroup: &str, uid: u32) -> Result<PathBuf> {
         .trim();
 
     let marker = format!("user@{uid}.service");
-    // Keep the path up to and including the user@<uid>.service segment — the
-    // systemd delegation boundary we can create children under.
+    // Build the path up to and including the user@<uid>.service segment — the
+    // systemd delegation boundary we can create children under — matching it as a
+    // whole path segment (never a substring; see the adversarial-lookalike tests).
     let mut acc = PathBuf::from("/sys/fs/cgroup");
-    let mut found = false;
     for segment in rel.split('/').filter(|s| !s.is_empty()) {
         acc.push(segment);
         if segment == marker {
-            found = true;
-            break;
+            return Ok(acc);
         }
     }
-    if !found {
-        return Err(NonoError::SandboxInit(format!(
-            "resource: no delegated cgroup v2 subtree for this session \
-             (expected a '{marker}' ancestor in '{rel}'); resource limits \
-             require a delegated user session (systemd Delegate=yes)"
-        )));
-    }
-    Ok(acc)
+    Err(NonoError::SandboxInit(format!(
+        "resource: no delegated cgroup v2 subtree for this session \
+         (expected a '{marker}' ancestor in '{rel}'); resource limits \
+         require a delegated user session (systemd Delegate=yes)"
+    )))
 }
 
 /// Verify the controllers we need are enabled for child cgroups. A cgroup only

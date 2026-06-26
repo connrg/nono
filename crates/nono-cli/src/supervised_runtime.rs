@@ -295,9 +295,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
 
     let exit_code = {
         // Runs in the parent the instant the child is forked, with the child's
-        // pid; records it on the session. The cgroup attach is done by the child
-        // itself (see `resource_procs_fd` above), so there is no escape window for
-        // the parent to close here.
+        // pid; records it on the session. The cgroup attach is the child's own
+        // job (see `resource_procs_fd` above), so there is no parent-side escape
+        // window to close here.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
@@ -305,16 +305,11 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         };
 
         // Post-mortem hook, installed only when a resource cgroup leaf exists.
-        // When the kernel OOM-kills the sandbox for crossing a memory cap, the
-        // child comes back as a bare SIGKILL (exit 137) with no explanation. The
-        // hook reads the leaf's OOM evidence while it still exists and prints a
-        // precise diagnostic, so a cap breach is loud rather than silent.
-        // Returning `true` suppresses the generic "killed by SIGKILL" footer.
-        //
-        // A run with no limit installs no hook (`None`), taking the exact
-        // pre-feature path.
-        #[cfg(target_os = "linux")]
-        let install_exit_diag = cgroup_leaf.is_some();
+        // The kernel OOM-kills the sandbox for crossing a memory cap as a bare
+        // SIGKILL (exit 137) with no explanation; the hook reads the leaf's OOM
+        // evidence while it still exists and prints a precise diagnostic, so a
+        // cap breach is loud rather than silent. Returning `true` suppresses the
+        // generic "killed by SIGKILL" footer.
         #[cfg(target_os = "linux")]
         let mut on_exit_diag_fn = |code: i32| -> bool {
             // Only explain the exit code the kernel delivers when the whole
@@ -326,20 +321,18 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
             if code != OOM_SIGKILL_EXIT {
                 return false;
             }
-            match cgroup_leaf.as_ref().and_then(|leaf| leaf.oom_report()) {
-                Some(report) => {
+            cgroup_leaf
+                .as_ref()
+                .and_then(|leaf| leaf.oom_report())
+                .is_some_and(|report| {
                     crate::output::print_oom_diagnostic(&report, silent);
                     true
-                }
-                None => false,
-            }
+                })
         };
+        // No leaf, no hook (`None`) — the exact pre-feature path.
         #[cfg(target_os = "linux")]
-        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = if install_exit_diag {
-            Some(&mut on_exit_diag_fn)
-        } else {
-            None
-        };
+        let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> =
+            cgroup_leaf.is_some().then_some(&mut on_exit_diag_fn);
         #[cfg(not(target_os = "linux"))]
         let on_exit_diag: Option<&mut dyn FnMut(i32) -> bool> = None;
 

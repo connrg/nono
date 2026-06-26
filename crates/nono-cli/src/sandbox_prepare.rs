@@ -580,10 +580,10 @@ fn finalize_prepared_sandbox(
     // happens later in the supervised runtime; here we just attach the parsed
     // limits to the capability set (also shown in `--dry-run`).
     if let Some(ref s) = args.memory {
-        let memory_bytes = Some(nono::resource::parse_size(s)?);
-        prepared.caps = prepared
-            .caps
-            .with_resource_limits(nono::ResourceLimits { memory_bytes });
+        let memory_bytes = nono::resource::parse_size(s)?;
+        prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
+            memory_bytes: Some(memory_bytes),
+        });
     }
 
     // SECURITY: a memory cap is enforced through cgroup control files under

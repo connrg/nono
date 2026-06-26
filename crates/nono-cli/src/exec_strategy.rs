@@ -477,8 +477,8 @@ pub fn execute_supervised(
     // telling the user two competing stories.
     mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
-    // Only the Linux cgroup self-attach path below uses `resource_procs_fd`;
-    // mark it used elsewhere so the strict `-D warnings` build stays clean.
+    // Used only by the Linux self-attach path below; silence the unused-var
+    // warning under the strict `-D warnings` build off Linux.
     #[cfg(not(target_os = "linux"))]
     let _ = resource_procs_fd;
 
@@ -1317,9 +1317,8 @@ pub fn execute_supervised(
             };
 
             // Let the caller explain this specific exit (e.g. the resource cgroup
-            // turning a bare SIGKILL into an explicit memory-cap diagnostic). If it
-            // does, suppress the generic footer below so the user gets one clear
-            // story instead of two competing ones.
+            // turning a bare SIGKILL into a memory-cap diagnostic). If it does,
+            // the generic footer below is suppressed so the user gets one story.
             let specialized_diagnostic = on_exit_diagnostic
                 .take()
                 .is_some_and(|hook| hook(exit_code));
