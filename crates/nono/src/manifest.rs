@@ -196,7 +196,7 @@ mod resource_tests {
         );
     }
 
-    // ---- #1102 additions: memory-only schema contract ----
+    // ---- Memory-only schema contract ----
 
     #[test]
     fn resources_rejects_removed_cpu_and_procs_keys() {

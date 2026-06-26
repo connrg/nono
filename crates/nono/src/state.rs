@@ -20,8 +20,8 @@ pub struct SandboxState {
     pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
-    /// Resource ceilings (memory, CPU bandwidth, process count). Absent in states persisted
-    /// by older nono builds; `#[serde(default)]` preserves backward compat.
+    /// Resource ceilings (currently memory). Absent in states persisted by
+    /// older nono builds; `#[serde(default)]` preserves backward compat.
     /// These are plain numbers, so unlike paths they need no re-validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
@@ -240,7 +240,7 @@ mod tests {
         assert!(state.resource_limits.is_none());
     }
 
-    // ---- #1102 additions: on-disk shape & backward-compat ----
+    // ---- On-disk shape & backward-compat ----
 
     #[test]
     fn state_without_limits_omits_resource_limits_key() {
@@ -284,7 +284,8 @@ mod tests {
 
     #[test]
     fn legacy_state_defaults_resource_limits_and_unix_sockets() {
-        // A pre-#1102 state JSON has neither resource_limits nor unix_sockets.
+        // An older state JSON (predating these fields) has neither
+        // resource_limits nor unix_sockets.
         // #[serde(default)] on both must fill them in (None / empty) without error
         // — this is the backward-compat guarantee for states on disk from older
         // nono builds.

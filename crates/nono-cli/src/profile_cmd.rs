@@ -3160,8 +3160,8 @@ fn resolve_to_manifest(
         process,
         rollback,
         credentials,
-        // Profiles do not yet express resource limits (issue #1102); they are
-        // set via CLI flags or a hand-written manifest for now.
+        // Profiles do not yet express resource limits; they are set via CLI
+        // flags or a hand-written manifest for now.
         resources: None,
     })
 }

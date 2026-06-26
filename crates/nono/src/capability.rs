@@ -915,10 +915,9 @@ pub struct CapabilitySet {
     /// When set, the generated Seatbelt profile emits `(debug deny)` so
     /// sandboxd records denial events in the unified log.
     seatbelt_debug_deny: bool,
-    /// Resource ceilings (memory, CPU bandwidth, process count) for the
-    /// sandboxed tree. Issue #1102: plumbed through here so they ride the
-    /// serialization layer like other policy; enforced by the supervisor via
-    /// cgroup v2 on Linux.
+    /// Resource ceilings (currently memory) for the sandboxed tree. Plumbed
+    /// through here so they ride the serialization layer like other policy;
+    /// enforced by the supervisor via cgroup v2 on Linux.
     resource_limits: Option<ResourceLimits>,
 }
 
@@ -1023,11 +1022,10 @@ impl CapabilitySet {
         self
     }
 
-    /// Attach resource ceilings (memory, CPU bandwidth, process count) to the
-    /// set (builder pattern).
+    /// Attach resource ceilings (currently memory) to the set (builder pattern).
     ///
-    /// Issue #1102: the limits are carried through serialization, surfaced in
-    /// `--dry-run`, and enforced by the supervisor via cgroup v2 on Linux.
+    /// The limits are carried through serialization, surfaced in `--dry-run`,
+    /// and enforced by the supervisor via cgroup v2 on Linux.
     #[must_use]
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = Some(limits);
@@ -3499,7 +3497,7 @@ mod tests {
         assert!(summary.contains("dir"));
     }
 
-    // ---- #1102 additions: resource-limit builder ----
+    // ---- Resource-limit builder ----
 
     #[test]
     fn capabilityset_with_and_get_resource_limits_roundtrip() {

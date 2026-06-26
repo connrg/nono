@@ -4,8 +4,8 @@
 //! [`crate::manifest`] types are the on-disk contract. (Same split as
 //! [`crate::capability::CapabilitySet`] vs the manifest.)
 //!
-//! Scope note (issue #1102): this module defines the limits and parses them
-//! from human-friendly CLI input; the configuration, serialization, and
+//! Scope note: this module defines the limits and parses them from
+//! human-friendly CLI input; the configuration, serialization, and
 //! `--dry-run` layers carry them end-to-end. Enforcement lives in the CLI
 //! supervisor (`nono-cli`'s `resource_cgroup`), which renders these values to
 //! cgroup v2 knobs on Linux — keeping the library policy-free.
@@ -101,9 +101,12 @@ pub fn parse_size(input: &str) -> Result<u64> {
 }
 
 /// Format a byte count with binary units for display (e.g. `512.0 MiB`).
+///
+/// Shared by [`ResourceLimits::summary`] and the CLI's failure diagnostics so a
+/// limit and the memory that breached it are rendered the same way everywhere.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
-fn format_bytes(bytes: u64) -> String {
+pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut val = bytes as f64;
     let mut idx = 0;
@@ -192,7 +195,7 @@ mod tests {
         assert_eq!(limits, back);
     }
 
-    // ---- #1102 additions: pure-function correctness & serde contract ----
+    // ---- Pure-function correctness & serde contract ----
 
     #[test]
     fn parse_size_zero_forms_and_leading_chars() {

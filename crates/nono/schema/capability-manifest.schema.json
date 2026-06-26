@@ -40,7 +40,7 @@
     },
     "resources": {
       "$ref": "#/$defs/Resources",
-      "description": "Per-process and per-tree resource ceilings enforced by the supervisor (memory, CPU bandwidth, process count). Requires exec_strategy: \"supervised\"."
+      "description": "Resource ceilings for the sandboxed process tree (currently memory), enforced by the supervisor. Requires exec_strategy: \"supervised\"."
     }
   },
   "$defs": {

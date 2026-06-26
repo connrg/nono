@@ -1,4 +1,4 @@
-//! Linux cgroup v2 resource enforcement (issue #1102).
+//! Linux cgroup v2 resource enforcement.
 //!
 //! # What this does, in plain terms
 //!
@@ -92,6 +92,26 @@ pub struct CgroupLeaf {
     procs: File,
 }
 
+/// Post-mortem evidence that the kernel OOM-killed something inside this leaf,
+/// read from `memory.events` (plus the limit and peak gauges) while the leaf
+/// still exists. Lets the supervisor turn a bare SIGKILL into an explicit
+/// "you hit the memory cap" message instead of failing silently.
+#[derive(Debug, Clone, Copy)]
+pub struct OomReport {
+    /// `oom_kill` from `memory.events`: how many processes the kernel killed in
+    /// this leaf because the tree ran out of memory under the cap.
+    pub oom_kills: u64,
+    /// `oom_group_kill` from `memory.events`: how many times the kernel killed
+    /// the whole leaf as one group (our `memory.oom.group=1`). Stays 0 on
+    /// kernels older than 5.14, which do not expose the counter.
+    pub oom_group_kills: u64,
+    /// The enforced ceiling (`memory.max`) in bytes, if still readable.
+    pub limit_bytes: Option<u64>,
+    /// Peak memory the tree reached (`memory.peak`) in bytes, if the kernel
+    /// exposes it (Linux 5.19+). Typically sits right at the cap on an OOM kill.
+    pub peak_bytes: Option<u64>,
+}
+
 impl CgroupLeaf {
     /// Create the leaf, write the requested knobs, and open its `cgroup.procs`
     /// for the child to self-attach through. Pre-fork; fail-closed.
@@ -158,6 +178,56 @@ impl CgroupLeaf {
     pub fn procs_raw_fd(&self) -> RawFd {
         self.procs.as_raw_fd()
     }
+
+    /// Read OOM evidence from the leaf's `memory.events`. Call this right after
+    /// the child exits and *before* the leaf is torn down. Returns `Some` only
+    /// when the kernel recorded at least one OOM kill in this leaf — i.e. the
+    /// memory cap was actually hit — so the caller can explain a SIGKILL that
+    /// would otherwise look unexplained.
+    ///
+    /// Best-effort and infallible: an unreadable knob yields `None` (or an
+    /// absent optional field) rather than an error, so a missing or stripped-down
+    /// `memory.events` never derails the exit path or teardown.
+    #[must_use]
+    pub fn oom_report(&self) -> Option<OomReport> {
+        let events = fs::read_to_string(self.path.join("memory.events")).ok()?;
+        let oom_kills = event_counter(&events, "oom_kill");
+        let oom_group_kills = event_counter(&events, "oom_group_kill");
+        // Nothing was OOM-killed here: the cap was not the cause, so stay quiet.
+        if oom_kills == 0 && oom_group_kills == 0 {
+            return None;
+        }
+        let gauge = |knob: &str| -> Option<u64> {
+            fs::read_to_string(self.path.join(knob))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        };
+        Some(OomReport {
+            oom_kills,
+            oom_group_kills,
+            limit_bytes: gauge("memory.max"),
+            peak_bytes: gauge("memory.peak"),
+        })
+    }
+}
+
+/// Read one counter (e.g. `oom_kill`) out of a cgroup `memory.events` table.
+/// Each line is `key value`; an absent or unparsable key reads as 0 so a
+/// partial or future-extended file never panics.
+fn event_counter(events: &str, key: &str) -> u64 {
+    events
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(' ')?;
+            if name == key {
+                value.trim().parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
 }
 
 impl Drop for CgroupLeaf {
@@ -426,7 +496,28 @@ mod tests {
         assert_eq!(format_pid_decimal(-1, &mut buf), b"0");
     }
 
-    // ---- #1102 additions: adversarial component-wise matching & pid property ----
+    /// `oom_report` drives the post-mortem "you hit the memory cap" message off
+    /// these counters, so the `memory.events` parser must pull the right line and
+    /// treat a missing or junk key as 0 (never panic on a partial/extended file).
+    #[test]
+    fn event_counter_reads_named_lines_and_defaults_missing_to_zero() {
+        use super::event_counter;
+
+        // A representative cgroup v2 memory.events table.
+        let events = "low 0\nhigh 0\nmax 12\noom 3\noom_kill 2\noom_group_kill 1\n";
+        assert_eq!(event_counter(events, "oom_kill"), 2);
+        assert_eq!(event_counter(events, "oom_group_kill"), 1);
+        assert_eq!(event_counter(events, "max"), 12);
+        // An absent key reads as 0, so a kernel without oom_group_kill is fine.
+        assert_eq!(event_counter(events, "oom_group_kill_missing"), 0);
+        assert_eq!(event_counter("", "oom_kill"), 0);
+        // A non-numeric value is ignored rather than panicking.
+        assert_eq!(event_counter("oom_kill notanumber\n", "oom_kill"), 0);
+        // A prefix of a real key must not match (whole-key, space-delimited).
+        assert_eq!(event_counter("oom_killer 9\n", "oom_kill"), 0);
+    }
+
+    // ---- Adversarial component-wise matching & pid property ----
 
     /// SECURITY: the delegation boundary is matched by whole path SEGMENT
     /// (`segment == marker`), never by substring. A `starts_with`/`contains`
@@ -571,7 +662,7 @@ mod tests {
         }
     }
 
-    // ---- #1102 LIVE cgroup v2 enforcement tests ----
+    // ---- Live cgroup v2 enforcement tests ----
     //
     // These are #[ignore]-gated: they create real cgroup leaves under
     // /sys/fs/cgroup, run a bounded memory bomb, and read kernel knobs. They are
@@ -589,7 +680,7 @@ mod tests {
     /// allocates past the cap is OOM-killed (SIGKILL); the leaf records
     /// oom_kill>=1; swap stayed at 0 (no escape); the parent survives; and
     /// drop/teardown removes the leaf. This is the actual security property of
-    /// #1102, proven against a real cgroupfs.
+    /// the memory limiter, proven against a real cgroupfs.
     #[test]
     #[ignore = "requires live cgroup v2 delegation (memory controller); run with --ignored"]
     fn live_child_over_memory_cap_is_oom_killed_and_only_it() {
@@ -686,6 +777,18 @@ mod tests {
                 // kill: oom.group scoped the kill to the leaf, not this process.
             }
         }
+
+        // The supervisor reads the same evidence via oom_report() to drive the
+        // user-facing diagnostic: it must report the kill and echo the cap.
+        let report = leaf
+            .oom_report()
+            .expect("oom_report must surface the recorded OOM kill");
+        assert!(report.oom_kills >= 1, "oom_report.oom_kills must be >= 1");
+        assert_eq!(
+            report.limit_bytes,
+            Some(CAP),
+            "oom_report must echo the enforced memory.max"
+        );
 
         // Drop runs teardown: kill survivors, rmdir the leaf.
         drop(leaf);

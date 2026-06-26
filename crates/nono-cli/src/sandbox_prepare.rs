@@ -577,8 +577,8 @@ fn finalize_prepared_sandbox(
     // Resource limits from CLI flags. The manifest path already populated caps
     // via `CapabilitySet::try_from`; flags and `--config` are mutually exclusive
     // (clap `conflicts_with`), so this only fires on the flag path. Enforcement
-    // happens later in the supervised runtime (issue #1102); here we just attach
-    // the parsed limits to the capability set (also shown in `--dry-run`).
+    // happens later in the supervised runtime; here we just attach the parsed
+    // limits to the capability set (also shown in `--dry-run`).
     if let Some(ref s) = args.memory {
         let memory_bytes = Some(nono::resource::parse_size(s)?);
         prepared.caps = prepared

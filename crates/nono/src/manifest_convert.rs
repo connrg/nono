@@ -162,7 +162,7 @@ mod tests {
         assert!(caps.resource_limits().is_none());
     }
 
-    // ---- #1102 additions: TryFrom enforces validate(); empty resources maps clean ----
+    // ---- TryFrom enforces validate(); empty resources maps clean ----
 
     #[test]
     fn try_from_runs_validate_and_rejects_unsupervised_memory() {

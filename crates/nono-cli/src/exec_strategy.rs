@@ -458,6 +458,7 @@ fn push_set_vars(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn execute_supervised(
     config: &ExecConfig<'_>,
     supervisor: Option<&SupervisorConfig<'_>>,
@@ -466,9 +467,15 @@ pub fn execute_supervised(
     pty_pair: Option<crate::pty_proxy::PtyPair>,
     pty_session_id: Option<&str>,
     // Write fd of the resource cgroup's `cgroup.procs`, opened by the caller
-    // pre-fork (issue #1102). When set, the forked child self-attaches through
-    // it before applying the sandbox or exec'ing. Unused off Linux.
+    // pre-fork. When set, the forked child self-attaches through it before
+    // applying the sandbox or exec'ing. Unused off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
+    // Optional post-mortem hook, called once with the child's exit code after it
+    // is reaped. It may print a specialized diagnostic (e.g. the resource
+    // cgroup's memory-cap explanation). Returning `true` means it fully explained
+    // the failure, so the generic exit/denial footer is suppressed to avoid
+    // telling the user two competing stories.
+    mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
     let program = &config.command[0];
     let cmd_args = &config.command[1..];
@@ -800,8 +807,8 @@ pub fn execute_supervised(
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
-            // Resource cgroup self-attach (issue #1102). Before the child
-            // applies its sandbox or execs, it writes its OWN pid into the leaf
+            // Resource cgroup self-attach. Before the child applies its
+            // sandbox or execs, it writes its OWN pid into the leaf
             // cgroup through the fd inherited from the parent. Doing this here —
             // before the child can fork or exec anything — caps the whole
             // process tree by construction and closes the post-fork escape
@@ -1304,6 +1311,15 @@ pub fn execute_supervised(
                 }
             };
 
+            // Give the caller a chance to explain this specific exit (e.g. the
+            // resource cgroup turns a bare SIGKILL into an explicit memory-cap
+            // diagnostic). If it does, suppress the generic footer below so the
+            // user gets one clear story instead of two competing ones.
+            let specialized_diagnostic = on_exit_diagnostic
+                .take()
+                .map(|hook| hook(exit_code))
+                .unwrap_or(false);
+
             // Analyze PTY screen content for sandbox-related errors.
             let error_observation = pty_proxy
                 .as_ref()
@@ -1350,6 +1366,7 @@ pub fn execute_supervised(
             let prompt_error_observation = error_observation.clone();
 
             let should_print_diagnostics = !killed_by_timeout
+                && !specialized_diagnostic
                 && should_print_diagnostic_footer(
                     config.no_diagnostics,
                     exit_code,
@@ -1408,13 +1425,15 @@ pub fn execute_supervised(
                 crate::output::print_diagnostic_footer(&footer);
             }
 
-            if should_offer_profile_save(
-                config.no_diagnostics,
-                exit_code,
-                &prompt_policy_explanations,
-                &prompt_error_observation,
-                &visible_sandbox_violations,
-            ) {
+            if !specialized_diagnostic
+                && should_offer_profile_save(
+                    config.no_diagnostics,
+                    exit_code,
+                    &prompt_policy_explanations,
+                    &prompt_error_observation,
+                    &visible_sandbox_violations,
+                )
+            {
                 // Clear the forwarding target before prompting. The child is
                 // already dead; keeping CHILD_PID set would cause forward_signal
                 // to send Ctrl-C to the dead PID, swallowing it silently.
