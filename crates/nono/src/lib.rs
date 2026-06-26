@@ -68,7 +68,12 @@ pub use capability::{
     AccessMode, CapabilitySet, CapabilitySource, FsCapability, IpcMode, NetworkMode,
     ProcessInfoMode, SignalMode, SocketScope, UnixSocketCapability, UnixSocketMode, UnixSocketOp,
 };
-pub use diagnostic::{DenialReason, DenialRecord, IpcDenialRecord, SandboxViolation};
+pub use diagnostic::{
+    DenialReason, DenialRecord, IpcDenialRecord, NonoDiagnostic, NonoDiagnosticCode,
+    NonoDiagnosticDetail, NonoDiagnosticSeverity, NonoRemediation, SandboxViolation,
+    SessionDiagnosticReport, SessionObservationInput, StderrObservationKind, dedupe_denials,
+    filesystem_denials_from_violations, follow_up_diagnostics,
+};
 pub use error::{NonoError, Result};
 pub use keystore::{
     LoadedSecret, is_apple_password_uri, is_bw_uri, is_env_uri, is_file_uri, is_keyring_uri,
@@ -84,13 +89,14 @@ pub use resource::ResourceLimits;
 pub use sandbox::{DetectedAbi, LandlockScopePolicy, detect_abi, is_wsl2, landlock_scope_policy};
 pub use sandbox::{Sandbox, SupportInfo};
 pub use scrub::{
-    ScrubPolicy, ScrubPolicyDiff, scrub_argv, scrub_argv_with_policy, scrub_header,
+    ScrubPolicy, ScrubPolicyDiff, scrub_argv, scrub_argv_with_policy, scrub_env_name,
+    scrub_env_name_with_policy, scrub_env_value, scrub_env_value_with_policy, scrub_header,
     scrub_header_with_policy, scrub_value, scrub_value_with_policy,
 };
 pub use state::SandboxState;
 pub use supervisor::{
-    ApprovalBackend, ApprovalDecision, CapabilityRequest, SupervisorListener, SupervisorSocket,
-    UrlOpenRequest,
+    ApprovalBackend, ApprovalDecision, ApprovalRequest, CapabilityRequest, SupervisorListener,
+    SupervisorSocket, UrlOpenRequest,
 };
 pub use trust::{
     Enforcement, IncludePatterns, Publisher, SignerIdentity, TrustPolicy, VerificationOutcome,

@@ -417,6 +417,8 @@ struct PendingCwdAccessRequest {
 pub(crate) struct PreparedSandbox {
     pub(crate) caps: CapabilitySet,
     pub(crate) secrets: Vec<nono::LoadedSecret>,
+    pub(crate) profile_display_name: Option<String>,
+    pub(crate) command_policies: Option<crate::command_policy::CommandPoliciesConfig>,
     pub(crate) session_hooks: profile::SessionHooks,
     pub(crate) rollback_exclude_patterns: Vec<String>,
     pub(crate) rollback_exclude_globs: Vec<String>,
@@ -424,6 +426,8 @@ pub(crate) struct PreparedSandbox {
     pub(crate) allow_domain: Vec<profile::AllowDomainEntry>,
     pub(crate) credentials: Vec<String>,
     pub(crate) custom_credentials: HashMap<String, profile::CustomCredentialDef>,
+    pub(crate) credential_capture: HashMap<String, profile::CredentialCaptureEntry>,
+    pub(crate) tls_intercept: Option<profile::TlsInterceptConfig>,
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) upstream_bypass: Vec<String>,
     pub(crate) listen_ports: Vec<u16>,
@@ -443,10 +447,13 @@ pub(crate) struct PreparedSandbox {
     pub(crate) denied_env_vars: Option<Vec<String>>,
     /// Expanded `environment.set_vars` (key, expanded-value), `None` if absent.
     pub(crate) set_vars: Option<Vec<(String, String)>>,
-    /// True when the profile or CLI requested `network.block`. Carried
-    /// through because a CLI proxy flag (e.g. `--credential`) may later
-    /// override `caps` to `ProxyOnly`, losing the original intent.
-    pub(crate) network_block_requested: bool,
+    /// True when the profile's `network.block` is set. The CLI `--block-net`
+    /// flag is read directly from `SandboxArgs` at proxy-launch time, so only
+    /// the profile's contribution needs to be carried through.
+    pub(crate) profile_network_block: bool,
+    /// True when the profile or CLI requested HTTP/2 to upstream servers
+    /// (`network.allow_http2` or `--allow-http2`).
+    pub(crate) allow_http2_requested: bool,
 }
 
 fn resolved_workdir(args: &SandboxArgs) -> PathBuf {
@@ -571,6 +578,7 @@ pub(crate) fn resolve_detached_cwd_prompt_response(
 
 fn finalize_prepared_sandbox(
     mut prepared: PreparedSandbox,
+    blocked_grants: &[(PathBuf, Option<String>)],
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
@@ -595,7 +603,16 @@ fn finalize_prepared_sandbox(
     reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
-    output::print_capabilities(&prepared.caps, args.verbose, silent);
+    let proxy_intent = has_proxy_intent(args, &prepared);
+    let block_wins = args.block_net || (prepared.profile_network_block && !proxy_intent);
+    let proxy_pending = !block_wins && !args.allow_net && proxy_intent;
+    output::print_capabilities(
+        &prepared.caps,
+        blocked_grants,
+        args.verbose,
+        silent,
+        proxy_pending,
+    );
 
     if let Some(ref profile_name) = args.profile {
         crate::pack_update_hint::show_pack_update_hints(profile_name, silent);
@@ -656,6 +673,16 @@ fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Res
     Ok(())
 }
 
+/// Returns true if any CLI flag or profile field requires the proxy to run.
+fn has_proxy_intent(args: &SandboxArgs, prepared: &PreparedSandbox) -> bool {
+    args.has_proxy_flags()
+        || !prepared.credentials.is_empty()
+        || !prepared.custom_credentials.is_empty()
+        || prepared.network_profile.is_some()
+        || !prepared.allow_domain.is_empty()
+        || prepared.upstream_proxy.is_some()
+}
+
 pub(crate) fn validate_external_proxy_bypass(
     args: &SandboxArgs,
     prepared: &PreparedSandbox,
@@ -670,6 +697,78 @@ pub(crate) fn validate_external_proxy_bypass(
                 .to_string(),
         ));
     }
+    Ok(())
+}
+
+/// Validate that `--block-net` is not combined with flags that imply proxy
+/// mode, and that `--allow-endpoint` always has a matching credential.
+///
+/// These combinations are logically contradictory: `--block-net` prevents all
+/// outbound traffic, so proxy-mode flags would be silently ignored.
+pub(crate) fn validate_block_net_conflicts(
+    args: &SandboxArgs,
+    prepared: &PreparedSandbox,
+) -> Result<()> {
+    let block_net = args.block_net || prepared.profile_network_block;
+
+    if block_net {
+        // Credential injection requires the proxy to be reachable.
+        let has_credentials = !args.proxy_credential.is_empty() || !prepared.credentials.is_empty();
+        if has_credentials {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --credential are contradictory: \
+                 credential injection requires the proxy to be reachable"
+                    .to_string(),
+            ));
+        }
+
+        // A network profile configures proxy-mode filtering.
+        let has_network_profile =
+            args.network_profile.is_some() || prepared.network_profile.is_some();
+        if has_network_profile {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --network-profile are contradictory: \
+                 a network profile requires proxy mode"
+                    .to_string(),
+            ));
+        }
+
+        // --allow-domain implies proxy-filtered mode.
+        let has_allow_domain = !args.allow_proxy.is_empty() || !prepared.allow_domain.is_empty();
+        if has_allow_domain {
+            return Err(NonoError::ConfigParse(
+                "--block-net and --allow-domain are contradictory: \
+                 domain filtering requires proxy mode"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // --allow-endpoint without any credential is a no-op (and almost certainly
+    // a user error: the service name doesn't match any loaded credential).
+    if !args.allow_endpoint.is_empty() {
+        let has_credentials = !args.proxy_credential.is_empty()
+            || !prepared.credentials.is_empty()
+            || !prepared.custom_credentials.is_empty();
+        if !has_credentials {
+            return Err(NonoError::ConfigParse(
+                "--allow-endpoint requires at least one --credential \
+                 (no credential loaded for the named service)"
+                    .to_string(),
+            ));
+        }
+    }
+
+    // --proxy-port without any proxy-triggering flag is almost certainly a
+    // mistake: the port would be set but the proxy would never start.
+    if args.proxy_port.is_some() && !has_proxy_intent(args, prepared) {
+        return Err(NonoError::ConfigParse(
+            "--proxy-port has no effect without a proxy-mode flag \
+             (e.g. --credential, --network-profile, --allow-domain)"
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -1113,6 +1212,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             PreparedSandbox {
                 caps,
                 secrets: Vec::new(),
+                profile_display_name: None,
+                command_policies: None,
                 session_hooks: profile::SessionHooks::default(),
                 rollback_exclude_patterns,
                 rollback_exclude_globs,
@@ -1120,6 +1221,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allow_domain,
                 credentials,
                 custom_credentials: HashMap::new(),
+                credential_capture: HashMap::new(),
+                tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
                 listen_ports: Vec::new(),
@@ -1138,8 +1241,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
                 allowed_env_vars: None,
                 denied_env_vars: None,
                 set_vars: None,
-                network_block_requested: args.block_net,
+                profile_network_block: false,
+                allow_http2_requested: args.allow_http2,
             },
+            &[],
             args,
             silent,
         );
@@ -1148,6 +1253,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     let prepared_profile = prepare_profile(args, silent, &workdir)?;
     let crate::profile_runtime::PreparedProfile {
         loaded_profile,
+        command_policies,
         capability_elevation,
         #[cfg(target_os = "linux")]
         wsl2_proxy_policy,
@@ -1160,6 +1266,7 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         allow_domain: profile_allow_domain,
         credentials: profile_credentials,
         custom_credentials: profile_custom_credentials,
+        tls_intercept: profile_tls_intercept,
         upstream_proxy: profile_upstream_proxy,
         upstream_bypass: profile_upstream_bypass,
         listen_ports: profile_listen_ports,
@@ -1270,6 +1377,9 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
     // re-run validate_deny_overlaps after CWD/pack grants are added below,
     // because Landlock cannot enforce a deny that lives under a later allow.
     let prepared_deny_paths = prepared.deny_paths;
+    // User grants silently blocked by deny groups (macOS); folded into the
+    // capability summary instead of emitting one warning per path.
+    let blocked_grants = prepared.blocked_grants;
 
     // Apply raw Seatbelt rules from the profile (macOS only).
     #[cfg(target_os = "macos")]
@@ -1415,10 +1525,25 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         .as_ref()
         .map(|p| p.network.block)
         .unwrap_or(false);
-    let network_block_requested = args.block_net || profile_network_block;
+
+    // Capture the profile's `network.allow_http2` intent alongside the CLI flag.
+    let profile_allow_http2 = loaded_profile
+        .as_ref()
+        .map(|p| p.network.allow_http2)
+        .unwrap_or(false);
+    let allow_http2_requested = args.allow_http2 || profile_allow_http2;
 
     let profile_secrets = loaded_profile
-        .map(|profile| profile.env_credentials.mappings)
+        .as_ref()
+        .map(|profile| profile.env_credentials.mappings.clone())
+        .unwrap_or_default();
+    let profile_display_name = loaded_profile
+        .as_ref()
+        .map(|profile| profile.meta.name.clone())
+        .filter(|name| !name.is_empty());
+    let profile_credential_capture = loaded_profile
+        .as_ref()
+        .map(|profile| profile.credential_capture.clone())
         .unwrap_or_default();
     let loaded_secrets = load_env_credentials(args, &profile_secrets, silent)?;
 
@@ -1426,6 +1551,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
         PreparedSandbox {
             caps,
             secrets: loaded_secrets,
+            profile_display_name,
+            command_policies,
             session_hooks,
             rollback_exclude_patterns: profile_rollback_patterns,
             rollback_exclude_globs: profile_rollback_globs,
@@ -1433,6 +1560,8 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allow_domain: profile_allow_domain,
             credentials: profile_credentials,
             custom_credentials: profile_custom_credentials,
+            credential_capture: profile_credential_capture,
+            tls_intercept: profile_tls_intercept,
             upstream_proxy: profile_upstream_proxy,
             upstream_bypass: profile_upstream_bypass,
             listen_ports: profile_listen_ports,
@@ -1451,8 +1580,10 @@ pub(crate) fn prepare_sandbox(args: &SandboxArgs, silent: bool) -> Result<Prepar
             allowed_env_vars: profile_allowed_env_vars,
             denied_env_vars: profile_denied_env_vars,
             set_vars: profile_set_vars,
-            network_block_requested,
+            profile_network_block,
+            allow_http2_requested,
         },
+        &blocked_grants,
         args,
         silent,
     )
@@ -1943,5 +2074,169 @@ mod tests {
             memory_bytes: Some(64 * 1024 * 1024),
         });
         assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
+    }
+
+    fn empty_prepared() -> PreparedSandbox {
+        PreparedSandbox {
+            caps: CapabilitySet::default(),
+            secrets: Vec::new(),
+            profile_display_name: None,
+            command_policies: None,
+            session_hooks: profile::SessionHooks::default(),
+            rollback_exclude_patterns: Vec::new(),
+            rollback_exclude_globs: Vec::new(),
+            network_profile: None,
+            allow_domain: Vec::new(),
+            credentials: Vec::new(),
+            custom_credentials: std::collections::HashMap::new(),
+            credential_capture: std::collections::HashMap::new(),
+            tls_intercept: None,
+            upstream_proxy: None,
+            upstream_bypass: Vec::new(),
+            listen_ports: Vec::new(),
+            capability_elevation: false,
+            #[cfg(target_os = "linux")]
+            wsl2_proxy_policy: profile::Wsl2ProxyPolicy::default(),
+            #[cfg(target_os = "linux")]
+            af_unix_mediation: profile::LinuxAfUnixMediation::default(),
+            allow_launch_services_active: false,
+            allow_gpu_active: false,
+            open_url_origins: Vec::new(),
+            open_url_allow_localhost: false,
+            bypass_protection_paths: Vec::new(),
+            ignored_denial_paths: Vec::new(),
+            suppressed_system_service_operations: Vec::new(),
+            allowed_env_vars: None,
+            denied_env_vars: None,
+            set_vars: None,
+            profile_network_block: false,
+            allow_http2_requested: false,
+        }
+    }
+
+    #[test]
+    fn block_net_with_credential_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --credential");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_with_network_profile_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            network_profile: Some("strict".to_string()),
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --network-profile");
+        assert!(
+            err.to_string().contains("--block-net")
+                && err.to_string().contains("--network-profile"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_with_allow_domain_errors() {
+        let args = SandboxArgs {
+            block_net: true,
+            allow_proxy: vec!["example.com".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --block-net + --allow-domain");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--allow-domain"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn block_net_alone_is_valid() {
+        let args = SandboxArgs {
+            block_net: true,
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
+    }
+
+    #[test]
+    fn profile_network_block_with_credential_from_profile_errors() {
+        let args = SandboxArgs::default();
+        let mut prepared = empty_prepared();
+        prepared.profile_network_block = true;
+        prepared.credentials = vec!["github".to_string()];
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for profile network block + profile credential");
+        assert!(
+            err.to_string().contains("--block-net") && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_endpoint_without_credential_errors() {
+        let args = SandboxArgs {
+            allow_endpoint: vec!["openai:GET:/v1/chat/completions".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --allow-endpoint without --credential");
+        assert!(
+            err.to_string().contains("--allow-endpoint")
+                && err.to_string().contains("--credential"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn allow_endpoint_with_credential_is_valid() {
+        let args = SandboxArgs {
+            allow_endpoint: vec!["openai:GET:/v1/chat/completions".to_string()],
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
+    }
+
+    #[test]
+    fn proxy_port_without_proxy_intent_errors() {
+        let args = SandboxArgs {
+            proxy_port: Some(8080),
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        let err = validate_block_net_conflicts(&args, &prepared)
+            .expect_err("expected error for --proxy-port without proxy mode");
+        assert!(
+            err.to_string().contains("--proxy-port"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxy_port_with_credential_is_valid() {
+        let args = SandboxArgs {
+            proxy_port: Some(8080),
+            proxy_credential: vec!["openai".to_string()],
+            ..Default::default()
+        };
+        let prepared = empty_prepared();
+        assert!(validate_block_net_conflicts(&args, &prepared).is_ok());
     }
 }

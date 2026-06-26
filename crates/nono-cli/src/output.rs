@@ -52,7 +52,13 @@ pub fn print_banner(silent: bool) {
 /// When `verbose` is 0, only user-specified capabilities are shown (CLI flags
 /// and profile filesystem entries). System paths and group-resolved paths are
 /// hidden to reduce noise. Use `-v` to show all capabilities.
-pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
+pub fn print_capabilities(
+    caps: &CapabilitySet,
+    blocked_grants: &[(std::path::PathBuf, Option<String>)],
+    verbose: u8,
+    silent: bool,
+    proxy_pending: bool,
+) {
     if silent {
         return;
     }
@@ -121,6 +127,11 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
         }
     }
 
+    // Protected paths kept blocked despite a user grant (macOS deny groups).
+    // Folded into one row by default so a broad grant (e.g. ~/Library) that
+    // overlaps several deny groups does not produce a wall of warnings.
+    print_blocked_grants(blocked_grants, verbose, t);
+
     // AF_UNIX socket capabilities (issue #685 / #696)
     let unix_caps = caps.unix_socket_capabilities();
     if !unix_caps.is_empty() {
@@ -176,37 +187,58 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
     // Network status
     match caps.network_mode() {
         NetworkMode::Blocked => {
-            eprintln!(
-                "  {} {}",
-                theme::badge(" net ", t.red, BADGE_FG_DARK),
-                theme::fg("outbound blocked", t.subtext),
-            );
+            if proxy_pending {
+                // Profile set network.block but CLI added proxy flags — proxy
+                // will start in strict_filter mode and owns the network mode.
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.yellow, BADGE_FG_DARK),
+                    theme::fg("proxy (strict)", t.subtext),
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.red, BADGE_FG_DARK),
+                    theme::fg("outbound blocked", t.subtext),
+                );
+            }
         }
         NetworkMode::ProxyOnly { port, bind_ports } => {
+            let port_str = if *port == 0 {
+                String::new()
+            } else {
+                format!(" localhost:{port}")
+            };
             if bind_ports.is_empty() {
                 eprintln!(
                     "  {} {}",
                     theme::badge(" net ", t.yellow, BADGE_FG_DARK),
-                    theme::fg(&format!("proxy localhost:{port}"), t.subtext),
+                    theme::fg(&format!("proxy{port_str}"), t.subtext),
                 );
             } else {
                 let ports_str: Vec<String> = bind_ports.iter().map(|p| p.to_string()).collect();
+                let bind_info = format!(", bind: {}", ports_str.join(", "));
                 eprintln!(
                     "  {} {}",
                     theme::badge(" net ", t.yellow, BADGE_FG_DARK),
-                    theme::fg(
-                        &format!("proxy localhost:{port}, bind: {}", ports_str.join(", ")),
-                        t.subtext,
-                    ),
+                    theme::fg(&format!("proxy{port_str}{bind_info}"), t.subtext,),
                 );
             }
         }
         NetworkMode::AllowAll => {
-            eprintln!(
-                "  {} {}",
-                theme::badge(" net ", t.green, BADGE_FG_DARK),
-                theme::fg("outbound allowed", t.subtext),
-            );
+            if proxy_pending {
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.yellow, BADGE_FG_DARK),
+                    theme::fg("proxy", t.subtext),
+                );
+            } else {
+                eprintln!(
+                    "  {} {}",
+                    theme::badge(" net ", t.green, BADGE_FG_DARK),
+                    theme::fg("outbound allowed", t.subtext),
+                );
+            }
         }
     }
     if !caps.localhost_ports().is_empty() {
@@ -227,6 +259,69 @@ pub fn print_capabilities(caps: &CapabilitySet, verbose: u8, silent: bool) {
 }
 
 /// Format an access mode as a fixed-width colored badge
+/// Render the paths that a deny group keeps blocked despite a user grant.
+///
+/// Collapsed by default to a single row (a broad grant such as `~/Library`
+/// overlaps many deny groups and would otherwise emit one warning per path).
+/// `-v` expands to the full paths grouped by the deny rule that blocks them,
+/// with the `--bypass-protection` escape hatch shown once.
+fn print_blocked_grants(
+    blocked: &[(std::path::PathBuf, Option<String>)],
+    verbose: u8,
+    t: &theme::Theme,
+) {
+    if blocked.is_empty() {
+        return;
+    }
+
+    let badge = theme::badge("deny ", t.yellow, BADGE_FG_DARK);
+
+    if verbose == 0 {
+        let n = blocked.len();
+        let noun = if n == 1 { "path" } else { "paths" };
+        eprintln!(
+            "  {} {}",
+            badge,
+            theme::fg(
+                &format!("{n} sensitive {noun} kept blocked inside your grants (-v to show)"),
+                t.subtext,
+            ),
+        );
+        return;
+    }
+
+    eprintln!(
+        "  {} {}",
+        badge,
+        theme::fg("sensitive paths kept blocked despite your grants:", t.text),
+    );
+
+    // Group by the deny rule that blocks each path, preserving first-seen order.
+    let mut groups: Vec<(String, Vec<&std::path::Path>)> = Vec::new();
+    for (path, group) in blocked {
+        let group_name = group.as_deref().unwrap_or("a deny rule");
+        match groups.iter_mut().find(|(name, _)| name == group_name) {
+            Some((_, paths)) => paths.push(path.as_path()),
+            None => groups.push((group_name.to_string(), vec![path.as_path()])),
+        }
+    }
+
+    for (name, paths) in &groups {
+        eprintln!("       {}", theme::fg(name, t.subtext));
+        for path in paths {
+            eprintln!("         {}", theme::fg(&path.to_string_lossy(), t.text));
+        }
+    }
+
+    eprintln!(
+        "       {}",
+        theme::fg(
+            "use --bypass-protection <path> to allow a specific path",
+            t.subtext,
+        ),
+    );
+}
+
 fn format_access_badge(access: &AccessMode) -> String {
     let t = theme::current();
     match access {
@@ -456,6 +551,54 @@ pub fn print_applying_sandbox(silent: bool) {
 pub fn print_warning(message: &str) {
     let t = theme::current();
     eprintln!("  {} {}", fg("warning:", t.red).bold(), fg(message, t.text),);
+}
+
+/// Print proxy credential warnings collected at startup.
+pub fn print_proxy_diagnostics(diagnostics: &[nono_proxy::ProxyDiagnostic]) {
+    if diagnostics.is_empty() {
+        return;
+    }
+
+    let t = theme::current();
+    eprintln!();
+    eprintln!(
+        "  {}",
+        theme::fg("Proxy credential warnings:", t.red).bold(),
+    );
+    for diagnostic in diagnostics {
+        let code = diagnostic.code.as_str();
+        eprintln!(
+            "  {} /{} — {}",
+            theme::fg(code, t.subtext),
+            diagnostic.route_prefix,
+            fg(&diagnostic.message, t.text),
+        );
+        if let Some(hint) = &diagnostic.hint {
+            eprintln!("    {}", theme::fg(hint, t.subtext));
+        } else if let Some(action) = proxy_diagnostic_action(&diagnostic.code) {
+            eprintln!("    {}", theme::fg(action, t.subtext));
+        }
+    }
+}
+
+fn proxy_diagnostic_action(code: &nono_proxy::ProxyDiagnosticCode) -> Option<&'static str> {
+    use nono_proxy::ProxyDiagnosticCode;
+    match code {
+        ProxyDiagnosticCode::CredentialNotFound => Some(
+            "Configure a valid credential reference for this route, or use an explicit upstream credential.",
+        ),
+        ProxyDiagnosticCode::CredentialUnavailable => Some(
+            "Unlock the system keychain or authenticate with your credential provider (e.g. `op signin`).",
+        ),
+        ProxyDiagnosticCode::OAuthClientIdUnavailable
+        | ProxyDiagnosticCode::OAuthClientSecretUnavailable => {
+            Some("Provide OAuth client credentials via env/keystore configuration for this route.")
+        }
+        ProxyDiagnosticCode::OAuthTokenExchangeFailed => {
+            Some("Verify OAuth client credentials and provider availability, then retry.")
+        }
+        _ => None,
+    }
 }
 
 /// Format startup-blocked lines for writing to /dev/tty or stderr.
@@ -992,9 +1135,11 @@ pub fn print_profile_hint(program: &str, profile: &str, silent: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::theme;
     use super::{
-        dry_run_command_line, format_unix_socket_mode_badge, print_capabilities,
-        print_profile_hint, render_diagnostic_footer, render_terminal_block_for_tty,
+        dry_run_command_line, format_unix_socket_mode_badge, print_blocked_grants,
+        print_capabilities, print_profile_hint, render_diagnostic_footer,
+        render_terminal_block_for_tty,
     };
     use nono::{CapabilitySet, UnixSocketMode};
     use std::ffi::{OsStr, OsString};
@@ -1097,7 +1242,32 @@ mod tests {
             .allow_unix_socket_dir(dir.path(), UnixSocketMode::ConnectBind)
             .expect("bind dir grant");
 
-        print_capabilities(&caps, 0, true);
-        print_capabilities(&caps, 1, true);
+        print_capabilities(&caps, &[], 0, true, false);
+        print_capabilities(&caps, &[], 1, true, false);
+    }
+
+    #[test]
+    fn print_blocked_grants_collapsed_and_verbose_do_not_panic() {
+        // Blocked grants render as one folded row by default and expand under
+        // -v; both paths (and the empty case) must render without panicking.
+        let t = theme::current();
+        let blocked = vec![
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/Google/Chrome"),
+                Some("deny_browser_data_macos".to_string()),
+            ),
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/1Password"),
+                Some("deny_keychains_macos".to_string()),
+            ),
+            (
+                std::path::PathBuf::from("/Users/x/Library/Application Support/Unknown"),
+                None,
+            ),
+        ];
+
+        print_blocked_grants(&blocked, 0, t);
+        print_blocked_grants(&blocked, 1, t);
+        print_blocked_grants(&[], 0, t);
     }
 }

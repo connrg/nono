@@ -108,6 +108,17 @@ pub struct ProxyConfig {
     /// Set by CLI `--proxy-ca-validity` flag.
     #[serde(default, skip)]
     pub ca_validity: Option<std::time::Duration>,
+
+    /// Optional leaf certificate validity override for TLS interception.
+    /// Leaf expiry is capped by the issuer CA expiry.
+    #[serde(default, skip)]
+    pub leaf_validity: Option<std::time::Duration>,
+
+    /// Enable HTTP/2 negotiation for upstream connections.
+    /// When false (default), the reverse proxy pool uses HTTP/1.1 with
+    /// keep-alive and the CONNECT intercept only advertises HTTP/1.1 ALPN.
+    #[serde(default)]
+    pub enable_h2: bool,
 }
 
 /// Pre-generated CA key material for cross-session CA reuse.
@@ -159,6 +170,8 @@ impl Default for ProxyConfig {
             intercept_parent_ca_pems: None,
             preloaded_ca: None,
             ca_validity: None,
+            leaf_validity: None,
+            enable_h2: false,
         }
     }
 }
@@ -168,7 +181,7 @@ fn default_bind_addr() -> IpAddr {
 }
 
 /// Configuration for a reverse proxy credential route.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouteConfig {
     /// Path prefix for routing (e.g., "openai").
     /// Must NOT include leading or trailing slashes — it is a bare service name, not a URL path.
@@ -243,6 +256,14 @@ pub struct RouteConfig {
     #[serde(default)]
     pub endpoint_rules: Vec<EndpointRule>,
 
+    /// Optional L7 endpoint policy with explicit allow/deny/approve routes.
+    ///
+    /// When omitted, `endpoint_rules` preserves the legacy behavior:
+    /// empty means allow-all, non-empty means default-deny with matching
+    /// rules allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_policy: Option<EndpointPolicyConfig>,
+
     /// Optional path to a PEM-encoded CA certificate file for upstream TLS.
     ///
     /// When set, the proxy trusts this CA in addition to the system roots
@@ -274,6 +295,13 @@ pub struct RouteConfig {
     /// Mutually exclusive with `credential_key` — use one or the other.
     #[serde(default)]
     pub oauth2: Option<OAuth2Config>,
+
+    /// Optional AWS SigV4 signing configuration.
+    ///
+    /// When present, the proxy will sign outbound requests with AWS SigV4
+    /// credentials. Mutually exclusive with `credential_key` and `oauth2`.
+    #[serde(default)]
+    pub aws_auth: Option<AwsAuthConfig>,
 }
 
 /// Optional proxy-side overrides for credential injection shape.
@@ -324,6 +352,65 @@ pub struct EndpointRule {
     pub path: String,
 }
 
+/// L7 endpoint action used by route endpoint policies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointPolicyDecision {
+    #[default]
+    Deny,
+    Approve,
+    Allow,
+}
+
+/// Default endpoint-policy action.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointPolicyDefault {
+    pub decision: EndpointPolicyDecision,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+impl Default for EndpointPolicyDefault {
+    fn default() -> Self {
+        Self {
+            decision: EndpointPolicyDecision::Deny,
+            backend: None,
+            timeout_secs: None,
+        }
+    }
+}
+
+/// An endpoint policy rule with optional approval routing metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointPolicyRule {
+    pub method: String,
+    pub path: String,
+    #[serde(default)]
+    pub backend: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Explicit L7 endpoint policy for a route.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointPolicyConfig {
+    #[serde(default)]
+    pub default: EndpointPolicyDefault,
+    #[serde(default)]
+    pub deny: Vec<EndpointPolicyRule>,
+    #[serde(default)]
+    pub approve: Vec<EndpointPolicyRule>,
+    #[serde(default)]
+    pub allow: Vec<EndpointPolicyRule>,
+}
+
 /// Pre-compiled endpoint rules for the request hot path.
 ///
 /// Built once at proxy startup from `EndpointRule` definitions. Holds
@@ -336,6 +423,41 @@ pub struct CompiledEndpointRules {
 struct CompiledRule {
     method: String,
     matcher: globset::GlobMatcher,
+}
+
+/// Compiled explicit endpoint policy for the request hot path.
+pub struct CompiledEndpointPolicy {
+    default: EndpointPolicyDefault,
+    deny: Vec<CompiledPolicyRule>,
+    approve: Vec<CompiledPolicyRule>,
+    allow: Vec<CompiledPolicyRule>,
+    explicit: bool,
+}
+
+struct CompiledPolicyRule {
+    method: String,
+    path: String,
+    matcher: globset::GlobMatcher,
+    backend: Option<String>,
+    reason: Option<String>,
+    timeout_secs: Option<u64>,
+}
+
+/// Result of evaluating a compiled endpoint policy.
+pub enum EndpointPolicyOutcome<'a> {
+    Allow {
+        rule_label: String,
+    },
+    Deny {
+        reason: Option<&'a str>,
+        rule_label: String,
+    },
+    Approve {
+        backend: Option<&'a str>,
+        reason: Option<&'a str>,
+        timeout_secs: Option<u64>,
+        rule_label: String,
+    },
 }
 
 impl CompiledEndpointRules {
@@ -371,6 +493,155 @@ impl CompiledEndpointRules {
             (r.method == "*" || r.method.eq_ignore_ascii_case(method))
                 && r.matcher.is_match(&normalized)
         })
+    }
+}
+
+impl CompiledEndpointPolicy {
+    /// Compile the route endpoint policy, preserving legacy endpoint_rules
+    /// behavior when no explicit policy is configured.
+    pub fn compile(
+        policy: Option<&EndpointPolicyConfig>,
+        legacy_rules: &[EndpointRule],
+    ) -> Result<Self, String> {
+        if let Some(policy) = policy {
+            return Self::compile_explicit(policy);
+        }
+
+        let allow = legacy_rules
+            .iter()
+            .map(|rule| EndpointPolicyRule {
+                method: rule.method.clone(),
+                path: rule.path.clone(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            })
+            .collect::<Vec<_>>();
+        let default = if allow.is_empty() {
+            EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            }
+        } else {
+            EndpointPolicyDefault::default()
+        };
+        Self::compile_explicit(&EndpointPolicyConfig {
+            default,
+            deny: Vec::new(),
+            approve: Vec::new(),
+            allow,
+        })
+        .map(|mut compiled| {
+            compiled.explicit = false;
+            compiled
+        })
+    }
+
+    fn compile_explicit(policy: &EndpointPolicyConfig) -> Result<Self, String> {
+        Ok(Self {
+            default: policy.default.clone(),
+            deny: compile_policy_rules(&policy.deny)?,
+            approve: compile_policy_rules(&policy.approve)?,
+            allow: compile_policy_rules(&policy.allow)?,
+            explicit: true,
+        })
+    }
+
+    /// `true` when the policy does not require L7 visibility.
+    #[must_use]
+    pub fn allows_all_without_l7(&self) -> bool {
+        self.deny.is_empty()
+            && self.approve.is_empty()
+            && self.allow.is_empty()
+            && self.default.decision == EndpointPolicyDecision::Allow
+    }
+
+    /// `true` when this was authored as an explicit endpoint policy.
+    #[must_use]
+    pub fn is_explicit(&self) -> bool {
+        self.explicit
+    }
+
+    /// Evaluate method+path using deny, approve, allow, default precedence.
+    #[must_use]
+    pub fn evaluate<'a>(&'a self, method: &str, path: &str) -> EndpointPolicyOutcome<'a> {
+        let normalized = normalize_path(path);
+        if let Some(rule) = first_policy_match(&self.deny, method, &normalized) {
+            return EndpointPolicyOutcome::Deny {
+                reason: rule.reason.as_deref(),
+                rule_label: format!("endpoint_policy.deny[{} {}]", rule.method, rule.path),
+            };
+        }
+        if let Some(rule) = first_policy_match(&self.approve, method, &normalized) {
+            return EndpointPolicyOutcome::Approve {
+                backend: rule.backend.as_deref(),
+                reason: rule.reason.as_deref(),
+                timeout_secs: rule.timeout_secs,
+                rule_label: format!("endpoint_policy.approve[{} {}]", rule.method, rule.path),
+            };
+        }
+        if let Some(rule) = first_policy_match(&self.allow, method, &normalized) {
+            return EndpointPolicyOutcome::Allow {
+                rule_label: format!("endpoint_policy.allow[{} {}]", rule.method, rule.path),
+            };
+        }
+
+        match self.default.decision {
+            EndpointPolicyDecision::Allow => EndpointPolicyOutcome::Allow {
+                rule_label: "endpoint_policy.default".to_string(),
+            },
+            EndpointPolicyDecision::Deny => EndpointPolicyOutcome::Deny {
+                reason: None,
+                rule_label: "endpoint_policy.default".to_string(),
+            },
+            EndpointPolicyDecision::Approve => EndpointPolicyOutcome::Approve {
+                backend: self.default.backend.as_deref(),
+                reason: None,
+                timeout_secs: self.default.timeout_secs,
+                rule_label: "endpoint_policy.default".to_string(),
+            },
+        }
+    }
+}
+
+fn compile_policy_rules(rules: &[EndpointPolicyRule]) -> Result<Vec<CompiledPolicyRule>, String> {
+    let mut compiled = Vec::with_capacity(rules.len());
+    for rule in rules {
+        let glob = Glob::new(&rule.path)
+            .map_err(|e| format!("invalid endpoint path pattern '{}': {}", rule.path, e))?;
+        compiled.push(CompiledPolicyRule {
+            method: rule.method.clone(),
+            path: rule.path.clone(),
+            matcher: glob.compile_matcher(),
+            backend: rule.backend.clone(),
+            reason: rule.reason.clone(),
+            timeout_secs: rule.timeout_secs,
+        });
+    }
+    Ok(compiled)
+}
+
+fn first_policy_match<'a>(
+    rules: &'a [CompiledPolicyRule],
+    method: &str,
+    normalized_path: &str,
+) -> Option<&'a CompiledPolicyRule> {
+    rules.iter().find(|r| {
+        (r.method == "*" || r.method.eq_ignore_ascii_case(method))
+            && r.matcher.is_match(normalized_path)
+    })
+}
+
+impl std::fmt::Debug for CompiledEndpointPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledEndpointPolicy")
+            .field("default", &self.default)
+            .field("deny_count", &self.deny.len())
+            .field("approve_count", &self.approve.len())
+            .field("allow_count", &self.allow.len())
+            .field("explicit", &self.explicit)
+            .finish()
     }
 }
 
@@ -499,6 +770,39 @@ pub struct OAuth2Config {
     /// OAuth2 scopes (space-separated). Empty = no scope parameter sent.
     #[serde(default)]
     pub scope: String,
+}
+
+/// AWS SigV4 signing configuration for a credential route.
+///
+/// When present on a route, the proxy will sign outbound requests using AWS
+/// SigV4. All fields are optional: an empty `aws_auth: {}` block is valid and
+/// uses the default credential chain with region and service auto-detected from
+/// the upstream URL.
+///
+/// Mutually exclusive with `credential_key` and `oauth2`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AwsAuthConfig {
+    /// AWS profile name to use for credentials.
+    /// If omitted, the default credential chain is used.
+    /// Must be non-empty with no whitespace if provided (whitespace breaks the
+    /// AWS INI config parser; profile names are case-sensitive).
+    #[serde(default)]
+    pub profile: Option<String>,
+
+    /// Explicit SigV4 signing region (e.g., `"us-east-1"`).
+    /// If omitted, auto-detected from the upstream URL.
+    /// Must be non-empty and lowercase if provided (SigV4 credential scope
+    /// requires lowercase region codes).
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Explicit SigV4 service name (e.g., `"bedrock"`, `"s3"`, `"execute-api"`).
+    /// If omitted, auto-detected from the upstream URL.
+    /// Must be non-empty and lowercase if provided (SigV4 credential scope
+    /// requires lowercase service codes).
+    #[serde(default)]
+    pub service: Option<String>,
 }
 
 #[cfg(test)]
@@ -722,6 +1026,90 @@ mod tests {
     }
 
     #[test]
+    fn test_compiled_endpoint_policy_preserves_legacy_allow_list() {
+        let rules = vec![EndpointRule {
+            method: "GET".to_string(),
+            path: "/v1/tasks/**".to_string(),
+        }];
+        let policy = CompiledEndpointPolicy::compile(None, &rules).unwrap();
+
+        assert!(matches!(
+            policy.evaluate("GET", "/v1/tasks/123"),
+            EndpointPolicyOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            policy.evaluate("POST", "/v1/tasks/123"),
+            EndpointPolicyOutcome::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn test_compiled_endpoint_policy_deny_beats_approve_and_allow() {
+        let policy = EndpointPolicyConfig {
+            default: EndpointPolicyDefault {
+                decision: EndpointPolicyDecision::Allow,
+                backend: None,
+                timeout_secs: None,
+            },
+            deny: vec![EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/v1/tasks/*/comments".to_string(),
+                backend: None,
+                reason: Some("blocked".to_string()),
+                timeout_secs: None,
+            }],
+            approve: vec![EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/v1/tasks/*/comments".to_string(),
+                backend: Some("terminal".to_string()),
+                reason: None,
+                timeout_secs: Some(5),
+            }],
+            allow: vec![EndpointPolicyRule {
+                method: "POST".to_string(),
+                path: "/v1/tasks/*/comments".to_string(),
+                backend: None,
+                reason: None,
+                timeout_secs: None,
+            }],
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        assert!(matches!(
+            compiled.evaluate("POST", "/v1/tasks/123/comments"),
+            EndpointPolicyOutcome::Deny {
+                reason: Some("blocked"),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_compiled_endpoint_policy_approve_route_carries_backend() {
+        let policy = EndpointPolicyConfig {
+            approve: vec![EndpointPolicyRule {
+                method: "GET".to_string(),
+                path: "/v1/secrets/**".to_string(),
+                backend: Some("terminal".to_string()),
+                reason: Some("sensitive endpoint".to_string()),
+                timeout_secs: Some(10),
+            }],
+            ..EndpointPolicyConfig::default()
+        };
+        let compiled = CompiledEndpointPolicy::compile(Some(&policy), &[]).unwrap();
+
+        assert!(matches!(
+            compiled.evaluate("GET", "/v1/secrets/token"),
+            EndpointPolicyOutcome::Approve {
+                backend: Some("terminal"),
+                reason: Some("sensitive endpoint"),
+                timeout_secs: Some(10),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_endpoint_allowed_multiple_rules() {
         let rules = vec![
             EndpointRule {
@@ -934,5 +1322,97 @@ mod tests {
                 "omitted format: Authorization header name is matched case-insensitively for Bearer default"
             );
         }
+    }
+
+    // ========================================================================
+    // AwsAuthConfig tests
+    // ========================================================================
+
+    #[test]
+    fn test_aws_auth_config_minimal_deserializes() {
+        let json = r#"{}"#;
+        let aws: AwsAuthConfig = serde_json::from_str(json).unwrap();
+        assert!(aws.profile.is_none());
+        assert!(aws.region.is_none());
+        assert!(aws.service.is_none());
+    }
+
+    #[test]
+    fn test_aws_auth_config_all_fields_roundtrip() {
+        let original = AwsAuthConfig {
+            profile: Some("my-aws-profile".to_string()),
+            region: Some("us-east-1".to_string()),
+            service: Some("bedrock".to_string()),
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let deserialized: AwsAuthConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.profile.as_deref(), Some("my-aws-profile"));
+        assert_eq!(deserialized.region.as_deref(), Some("us-east-1"));
+        assert_eq!(deserialized.service.as_deref(), Some("bedrock"));
+    }
+
+    #[test]
+    fn test_aws_auth_field_absent_is_none() {
+        let json = r#"{"prefix": "bedrock", "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com"}"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        assert!(route.aws_auth.is_none());
+    }
+
+    #[test]
+    fn test_aws_auth_config_unknown_field_rejected() {
+        let json = r#"{"profile": "foo", "unknown_field": "bar"}"#;
+        let result: std::result::Result<AwsAuthConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "unknown fields must be rejected by deny_unknown_fields"
+        );
+    }
+
+    #[test]
+    fn test_route_config_with_aws_auth_deserializes() {
+        let json = r#"{
+            "prefix": "bedrock",
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "my-aws-profile"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let aws = route.aws_auth.unwrap();
+        assert_eq!(aws.profile.as_deref(), Some("my-aws-profile"));
+        assert!(aws.region.is_none());
+        assert!(aws.service.is_none());
+    }
+
+    #[test]
+    fn test_route_config_with_full_aws_auth_deserializes() {
+        let json = r#"{
+            "prefix": "bedrock",
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "my-aws-profile",
+                "region": "us-west-2",
+                "service": "bedrock"
+            }
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let aws = route.aws_auth.unwrap();
+        assert_eq!(aws.profile.as_deref(), Some("my-aws-profile"));
+        assert_eq!(aws.region.as_deref(), Some("us-west-2"));
+        assert_eq!(aws.service.as_deref(), Some("bedrock"));
+    }
+
+    #[test]
+    fn test_aws_auth_empty_object_sets_all_none() {
+        let json = r#"{
+            "prefix": "bedrock",
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": {}
+        }"#;
+        let route: RouteConfig = serde_json::from_str(json).unwrap();
+        let aws = route.aws_auth.unwrap();
+        assert!(aws.profile.is_none());
+        assert!(aws.region.is_none());
+        assert!(aws.service.is_none());
     }
 }

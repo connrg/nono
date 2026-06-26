@@ -184,11 +184,22 @@ pub fn resolve_credentials(
     service_names: &[String],
     custom_credentials: &HashMap<String, CustomCredentialDef>,
 ) -> Result<Vec<RouteConfig>> {
-    if service_names.is_empty() {
+    // Build the full set of names to resolve from explicitly requested
+    // credentials. `custom_credentials` defines route templates, but does not
+    // enable them on its own.
+    let mut all_names: Vec<String> = Vec::new();
+    for name in service_names {
+        if !all_names.contains(name) {
+            all_names.push(name.clone());
+        }
+    }
+
+    if all_names.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Validate all requested services exist in either custom or built-in
+    // Validate all explicitly requested services exist in either custom or built-in.
+    // custom_credentials keys are always valid by definition.
     for name in service_names {
         if !custom_credentials.contains_key(name) && !policy.credentials.contains_key(name) {
             let mut available: Vec<_> = policy.credentials.keys().cloned().collect();
@@ -204,7 +215,7 @@ pub fn resolve_credentials(
 
     let mut routes = Vec::new();
 
-    for name in service_names {
+    for name in &all_names {
         // Custom credentials take precedence over built-in.
         // Note: Custom credentials are already validated at profile load time
         // in profile/mod.rs::validate_profile_custom_credentials(), so we don't
@@ -235,6 +246,7 @@ pub fn resolve_credentials(
                 proxy: cred.proxy.clone(),
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
+                endpoint_policy: cred.endpoint_policy.clone(),
                 tls_ca: cred
                     .tls_ca
                     .as_deref()
@@ -257,6 +269,7 @@ pub fn resolve_credentials(
                     })
                     .transpose()?,
                 oauth2,
+                aws_auth: cred.aws_auth.clone(),
             });
         } else if let Some(cred) = policy.credentials.get(name) {
             // Validate env_var against dangerous variable blocklist
@@ -284,10 +297,12 @@ pub fn resolve_credentials(
                 proxy: None,
                 env_var: cred.env_var.clone(),
                 endpoint_rules: cred.endpoint_rules.clone(),
+                endpoint_policy: None,
                 tls_ca: None, // Built-in credentials don't support custom CAs
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             });
         }
         // We already validated existence above, so this else branch won't be hit
@@ -410,10 +425,12 @@ pub fn partition_allow_domain(
                         proxy: None,
                         env_var: None,
                         endpoint_rules: endpoints.clone(),
+                        endpoint_policy: None,
                         tls_ca: None,
                         tls_client_cert: None,
                         tls_client_key: None,
                         oauth2: None,
+                        aws_auth: None,
                     });
                 }
             }
@@ -564,9 +581,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -604,9 +623,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -640,9 +661,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -686,9 +709,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -772,9 +797,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -805,9 +832,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -838,9 +867,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -876,9 +907,11 @@ mod tests {
                 proxy: None,
                 env_var: Some("OPENAI_API_KEY".to_string()),
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -1008,9 +1041,11 @@ mod tests {
                 proxy: None,
                 env_var: Some("LD_PRELOAD".to_string()),
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -1096,9 +1131,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -1144,9 +1181,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -1270,5 +1309,111 @@ mod tests {
 
         let result = partition_allow_domain(&policy, &entries);
         assert!(result.is_err());
+    }
+
+    /// A profile with `custom_credentials` but no `credentials` list passes an
+    /// empty `service_names` slice. `resolve_credentials` should not activate
+    /// route definitions unless they are explicitly named.
+    #[test]
+    fn test_resolve_credentials_custom_credentials_without_service_names_returns_no_routes() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "mockhttp".to_string(),
+            CustomCredentialDef {
+                upstream: "https://mockhttp.org".to_string(),
+                credential_key: Some("env://MOCK_API_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("MOCK_API_KEY".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &[], &custom).unwrap();
+        assert!(
+            routes.is_empty(),
+            "custom credential definitions should remain disabled until explicitly requested, got {} route(s)",
+            routes.len()
+        );
+    }
+
+    /// When `service_names` is empty but multiple `custom_credentials` are
+    /// defined, `resolve_credentials` should leave them all disabled.
+    #[test]
+    fn test_resolve_credentials_all_custom_credentials_without_service_names_returns_no_routes() {
+        use crate::profile::CustomCredentialDef;
+
+        let json = embedded_network_policy_json();
+        let policy = load_network_policy(json).unwrap();
+
+        let mut custom = HashMap::new();
+        custom.insert(
+            "svc_a".to_string(),
+            CustomCredentialDef {
+                upstream: "https://svc-a.example.com".to_string(),
+                credential_key: Some("env://SVC_A_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("SVC_A_KEY".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+        custom.insert(
+            "svc_b".to_string(),
+            CustomCredentialDef {
+                upstream: "https://svc-b.example.com".to_string(),
+                credential_key: Some("env://SVC_B_KEY".to_string()),
+                auth: None,
+                inject_mode: InjectMode::Header,
+                inject_header: "Authorization".to_string(),
+                credential_format: Some("Bearer {}".to_string()),
+                path_pattern: None,
+                path_replacement: None,
+                query_param_name: None,
+                proxy: None,
+                env_var: Some("SVC_B_KEY".to_string()),
+                endpoint_rules: vec![],
+                endpoint_policy: None,
+                tls_ca: None,
+                tls_client_cert: None,
+                tls_client_key: None,
+                aws_auth: None,
+            },
+        );
+
+        let routes = resolve_credentials(&policy, &[], &custom).unwrap();
+
+        assert!(
+            routes.is_empty(),
+            "custom credential definitions should remain disabled until explicitly requested, got {} route(s)",
+            routes.len()
+        );
     }
 }

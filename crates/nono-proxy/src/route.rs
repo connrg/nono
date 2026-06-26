@@ -10,7 +10,7 @@
 //! (inject mode, header name/value, raw secret). Both stores are keyed by the
 //! normalised route prefix and are consulted independently by the proxy handlers.
 
-use crate::config::{CompiledEndpointRules, RouteConfig};
+use crate::config::{CompiledEndpointPolicy, CompiledEndpointRules, RouteConfig};
 use crate::error::{ProxyError, Result};
 use nono::undo::{NetworkAuditAuthMechanism, NetworkAuditInjectionMode};
 use rustls::pki_types::pem::PemObject;
@@ -38,10 +38,24 @@ pub struct LoadedRoute {
     /// When empty, all method+path combinations are permitted.
     pub endpoint_rules: CompiledEndpointRules,
 
+    /// Pre-compiled explicit endpoint policy. When no explicit policy is
+    /// configured this preserves legacy `endpoint_rules` semantics.
+    pub endpoint_policy: CompiledEndpointPolicy,
+
     /// Per-route TLS connector with custom CA trust, if configured.
     /// Built once at startup from the route's `tls_ca` certificate file.
     /// When `None`, the shared default connector (webpki roots only) is used.
     pub tls_connector: Option<tokio_rustls::TlsConnector>,
+
+    /// Per-route TLS client config (same config backing `tls_connector`).
+    /// Stored separately so the upstream pool can build per-route pooled
+    /// clients without needing to extract the config from the connector.
+    pub tls_client_config: Option<std::sync::Arc<rustls::ClientConfig>>,
+
+    /// Stable identity for route TLS settings. Two routes with the same key can
+    /// share one HTTP/2 upstream connection without changing trust roots or
+    /// client certificate behavior between streams.
+    pub tls_config_key: Option<String>,
 
     /// `true` if this route requires L7 visibility — i.e. it declares
     /// `credential_key`, `oauth2`, or non-empty `endpoint_rules` and would
@@ -71,6 +85,7 @@ impl std::fmt::Debug for LoadedRoute {
             .field("upstream", &self.upstream)
             .field("upstream_host_port", &self.upstream_host_port)
             .field("endpoint_rules", &self.endpoint_rules)
+            .field("endpoint_policy", &self.endpoint_policy)
             .field("has_custom_tls_ca", &self.tls_connector.is_some())
             .field("requires_intercept", &self.requires_intercept)
             .field(
@@ -85,6 +100,11 @@ impl std::fmt::Debug for LoadedRoute {
 
 fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMechanism> {
     if route.oauth2.is_some() {
+        return Some(NetworkAuditAuthMechanism::PhantomHeader);
+    }
+
+    if route.aws_auth.is_some() {
+        // SigV4 signs via the Authorization header — same phantom token shape.
         return Some(NetworkAuditAuthMechanism::PhantomHeader);
     }
 
@@ -109,6 +129,11 @@ fn auth_mechanism_for_route(route: &RouteConfig) -> Option<NetworkAuditAuthMecha
 fn injection_mode_for_route(route: &RouteConfig) -> Option<NetworkAuditInjectionMode> {
     if route.oauth2.is_some() {
         return Some(NetworkAuditInjectionMode::OAuth2);
+    }
+
+    if route.aws_auth.is_some() {
+        // SigV4 injects via the Authorization header.
+        return Some(NetworkAuditInjectionMode::Header);
     }
 
     if route.credential_key.is_some() {
@@ -154,8 +179,14 @@ impl RouteStore {
 
             let endpoint_rules = CompiledEndpointRules::compile(&route.endpoint_rules)
                 .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
+            let endpoint_policy = CompiledEndpointPolicy::compile(
+                route.endpoint_policy.as_ref(),
+                &route.endpoint_rules,
+            )
+            .map_err(|e| ProxyError::Config(format!("route '{}': {}", normalized_prefix, e)))?;
 
-            let tls_connector = if route.tls_ca.is_some()
+            let tls_config_key = route_tls_config_key(route);
+            let (tls_connector, tls_client_config) = if route.tls_ca.is_some()
                 || route.tls_client_cert.is_some()
                 || route.tls_client_key.is_some()
             {
@@ -165,14 +196,15 @@ impl RouteStore {
                     route.tls_ca.is_some(),
                     route.tls_client_cert.is_some(),
                 );
-                Some(build_tls_connector(
+                let (connector, config) = build_tls_connector(
                     &base_root_store,
                     route.tls_ca.as_deref(),
                     route.tls_client_cert.as_deref(),
                     route.tls_client_key.as_deref(),
-                )?)
+                )?;
+                (Some(connector), Some(config))
             } else {
-                None
+                (None, None)
             };
 
             let upstream_host_port = extract_host_port(&route.upstream);
@@ -183,10 +215,11 @@ impl RouteStore {
             // they exist to provide a `*_BASE_URL` env var or appear in
             // `route_upstream_hosts()` — and CONNECT to those still gets
             // blocked with 403 (the "force SDK cooperation" path).
-            let requires_managed_credential =
-                route.credential_key.is_some() || route.oauth2.is_some();
+            let requires_managed_credential = route.credential_key.is_some()
+                || route.oauth2.is_some()
+                || route.aws_auth.is_some();
             let requires_intercept =
-                requires_managed_credential || !route.endpoint_rules.is_empty();
+                requires_managed_credential || !endpoint_policy.allows_all_without_l7();
             let managed_auth_mechanism = auth_mechanism_for_route(route);
             let managed_injection_mode = injection_mode_for_route(route);
 
@@ -196,7 +229,10 @@ impl RouteStore {
                     upstream: route.upstream.clone(),
                     upstream_host_port,
                     endpoint_rules,
+                    endpoint_policy,
                     tls_connector,
+                    tls_client_config,
+                    tls_config_key,
                     requires_intercept,
                     requires_managed_credential,
                     managed_auth_mechanism,
@@ -244,7 +280,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .is_some_and(|hp| *hp == normalised)
+                .is_some_and(|hp| host_port_matches(hp, &normalised))
         })
     }
 
@@ -259,7 +295,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .filter(|hp| **hp == normalised)
+                .filter(|hp| host_port_matches(hp, &normalised))
                 .map(|_| (prefix.as_str(), route))
         })
     }
@@ -276,7 +312,7 @@ impl RouteStore {
                 route
                     .upstream_host_port
                     .as_ref()
-                    .is_some_and(|hp| *hp == normalised)
+                    .is_some_and(|hp| host_port_matches(hp, &normalised))
             })
             .map(|(prefix, route)| (prefix.as_str(), route))
             .collect();
@@ -292,7 +328,7 @@ impl RouteStore {
             route
                 .upstream_host_port
                 .as_ref()
-                .is_some_and(|hp| *hp == normalised)
+                .is_some_and(|hp| host_port_matches(hp, &normalised))
                 && route.requires_intercept
         })
     }
@@ -307,6 +343,108 @@ impl RouteStore {
     }
 }
 
+/// Outcome of route selection for an intercepted request.
+///
+/// The shipping selection logic lives inline in `tls_intercept::handle`
+/// (`handle_inner_request`) because it is interleaved with the asynchronous
+/// `endpoint_policy` approval workflow, which cannot run inside this synchronous
+/// helper. `select_route` is retained as the unit-tested reference for the
+/// endpoint-authorization gate, ambiguity check, and credential-first priority
+/// (commit b0b2c743); keep it in sync with the loop in `handle_inner_request`.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) enum RouteSelection<'a> {
+    /// An `_ep_` endpoint-authorization route exists for the upstream but no
+    /// rule matched: hard-deny (403). Gates access before credential selection.
+    EndpointDenied,
+    /// More than one credential route matched the request: ambiguous (403).
+    /// Carries the matched route prefixes for the diagnostic.
+    Ambiguous(Vec<&'a str>),
+    /// A route was selected (`Some`) or the request is an un-credentialed
+    /// passthrough (`None`).
+    Selected(Option<(&'a str, &'a LoadedRoute)>),
+}
+
+/// Select the route for an intercepted request from `candidates` sharing one
+/// upstream, applying the endpoint-authorization gate, the ambiguity check, and
+/// credential-first priority.
+///
+/// Candidates are partitioned into four buckets by whether their endpoint rules
+/// matched this request and whether they carry a managed credential:
+///   * `matched_cred` / `matched_passthrough` — endpoint rules matched,
+///   * `catchall_cred` / `catchall_passthrough` — no endpoint rules (every path).
+///
+/// The *credential layer* is `matched_cred` when any credential route matched,
+/// otherwise `catchall_cred` (so a credential catch-all is still in play when
+/// only credential-less `_ep_` routes matched). Two credential routes in the
+/// active layer are ambiguous (the proxy must not silently pick one). Otherwise
+/// selection prefers, in order:
+/// 1. the single credential route from the active layer — a credential catch-all
+///    thus wins over a credential-less `_ep_` match so the managed token is
+///    injected rather than silently dropped,
+/// 2. a matched credential-less route (bare endpoint authorization),
+/// 3. a credential-less catch-all (un-credentialed passthrough).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn select_route<'a>(
+    candidates: &'a [(&'a str, &'a LoadedRoute)],
+    method: &str,
+    path: &str,
+) -> RouteSelection<'a> {
+    let mut matched_cred: Vec<(&str, &LoadedRoute)> = Vec::new();
+    let mut matched_passthrough: Vec<(&str, &LoadedRoute)> = Vec::new();
+    let mut catchall_cred: Vec<(&str, &LoadedRoute)> = Vec::new();
+    let mut catchall_passthrough: Vec<(&str, &LoadedRoute)> = Vec::new();
+    let mut has_endpoint_only_route = false;
+    let mut endpoint_authorized = false;
+    for (prefix, route) in candidates {
+        if route.endpoint_rules.is_empty() {
+            if route.requires_managed_credential {
+                catchall_cred.push((prefix, route));
+            } else {
+                catchall_passthrough.push((prefix, route));
+            }
+        } else if route.endpoint_rules.is_allowed(method, path) {
+            if route.requires_managed_credential {
+                matched_cred.push((prefix, route));
+            } else {
+                matched_passthrough.push((prefix, route));
+                endpoint_authorized = true;
+            }
+        } else if !route.requires_managed_credential {
+            has_endpoint_only_route = true;
+        }
+    }
+
+    // Endpoint-only authorization layer: a credential catch-all cannot bypass
+    // endpoint restrictions imposed by `_ep_` routes.
+    if has_endpoint_only_route && !endpoint_authorized {
+        return RouteSelection::EndpointDenied;
+    }
+
+    // Ambiguity applies only to credential-injection routes within the active
+    // layer; multiple endpoint-only authorization routes matching is fine (they
+    // all just allow). This catches both overlapping endpoint credential routes
+    // and overlapping credential catch-alls (e.g. two equally-specific wildcard
+    // upstreams).
+    let credential_layer: &[(&str, &LoadedRoute)] = if matched_cred.is_empty() {
+        &catchall_cred
+    } else {
+        &matched_cred
+    };
+    if credential_layer.len() > 1 {
+        let names = credential_layer.iter().map(|(p, _)| *p).collect();
+        return RouteSelection::Ambiguous(names);
+    }
+
+    let selected = credential_layer
+        .first()
+        .copied()
+        .or_else(|| matched_passthrough.first().copied())
+        .or_else(|| catchall_passthrough.first().copied());
+    RouteSelection::Selected(selected)
+}
+
 impl LoadedRoute {
     /// Whether this route is configured to require a proxy-managed credential
     /// but the credential material is currently unavailable.
@@ -315,8 +453,9 @@ impl LoadedRoute {
         &self,
         has_static_credential: bool,
         has_oauth2: bool,
+        has_aws: bool,
     ) -> bool {
-        self.requires_managed_credential && !has_static_credential && !has_oauth2
+        self.requires_managed_credential && !has_static_credential && !has_oauth2 && !has_aws
     }
 }
 
@@ -334,6 +473,45 @@ fn extract_host_port(url: &str) -> Option<String> {
     };
     let port = parsed.port().unwrap_or(default_port);
     Some(format!("{}:{}", host.to_lowercase(), port))
+}
+
+fn route_tls_config_key(route: &RouteConfig) -> Option<String> {
+    if route.tls_ca.is_none() && route.tls_client_cert.is_none() && route.tls_client_key.is_none() {
+        return None;
+    }
+
+    Some(format!(
+        "ca={};cert={};key={}",
+        route.tls_ca.as_deref().unwrap_or(""),
+        route.tls_client_cert.as_deref().unwrap_or(""),
+        route.tls_client_key.as_deref().unwrap_or("")
+    ))
+}
+
+fn host_port_matches(pattern: &str, target: &str) -> bool {
+    if pattern == target {
+        return true;
+    }
+    if !pattern.starts_with("*.") {
+        return false;
+    }
+
+    let Some((pattern_host, pattern_port)) = pattern.rsplit_once(':') else {
+        return false;
+    };
+    let Some((target_host, target_port)) = target.rsplit_once(':') else {
+        return false;
+    };
+    if pattern_port != target_port {
+        return false;
+    }
+
+    let Some(suffix) = pattern_host.strip_prefix("*.") else {
+        return false;
+    };
+    target_host
+        .strip_suffix(suffix)
+        .is_some_and(|prefix| prefix.ends_with('.') && prefix.len() > 1)
 }
 
 /// Read a PEM file, producing a clear `ProxyError::Config` for common failure modes.
@@ -380,12 +558,14 @@ fn build_base_root_store() -> rustls::RootCertStore {
 
 /// Build a per-route `TlsConnector`, optionally adding a custom CA
 /// and/or mTLS client certificate on top of `base_root_store`.
+/// Returns both the connector and the underlying `Arc<ClientConfig>` so the
+/// upstream pool can build per-route pooled clients.
 fn build_tls_connector(
     base_root_store: &rustls::RootCertStore,
     ca_path: Option<&str>,
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
-) -> Result<tokio_rustls::TlsConnector> {
+) -> Result<(tokio_rustls::TlsConnector, Arc<rustls::ClientConfig>)> {
     let mut root_store = base_root_store.clone();
 
     // Add custom CA if provided
@@ -505,14 +685,17 @@ fn build_tls_connector(
         tls_config.resumption = rustls::client::Resumption::disabled();
     }
 
-    Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+    let config_arc = Arc::new(tls_config);
+    let connector = tokio_rustls::TlsConnector::from(Arc::clone(&config_arc));
+    Ok((connector, config_arc))
 }
 
 /// Compatibility shim: build a connector with only a custom CA (no client cert).
 #[cfg(test)]
 fn build_tls_connector_with_ca(ca_path: &str) -> Result<tokio_rustls::TlsConnector> {
     let base = build_base_root_store();
-    build_tls_connector(&base, Some(ca_path), None, None)
+    let (connector, _config) = build_tls_connector(&base, Some(ca_path), None, None)?;
+    Ok(connector)
 }
 
 #[cfg(test)]
@@ -554,10 +737,12 @@ mod tests {
                     path: "/v1/models".to_string(),
                 },
             ],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -593,10 +778,12 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -619,10 +806,12 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).unwrap();
@@ -646,10 +835,12 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
             RouteConfig {
                 prefix: "anthropic".to_string(),
@@ -664,10 +855,12 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
         ];
 
@@ -711,12 +904,47 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_host_port_preserves_wildcard_host() {
+        assert_eq!(
+            extract_host_port("https://*.dev.example.net"),
+            Some("*.dev.example.net:443".to_string())
+        );
+    }
+
+    #[test]
+    fn test_host_port_matches_wildcard_subdomain_only() {
+        assert!(host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.dev.example.net:443"
+        ));
+        assert!(host_port_matches(
+            "*.dev.example.net:443",
+            "admin.dev.example.net:443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "dev.example.net:443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.dev.example.net:8443"
+        ));
+        assert!(!host_port_matches(
+            "*.dev.example.net:443",
+            "api.admin.other.net:443"
+        ));
+    }
+
+    #[test]
     fn test_loaded_route_debug() {
         let route = LoadedRoute {
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
             tls_connector: None,
+            tls_client_config: None,
+            tls_config_key: None,
             requires_intercept: false,
             requires_managed_credential: false,
             managed_auth_mechanism: None,
@@ -746,10 +974,12 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -764,6 +994,46 @@ mod tests {
             Some(NetworkAuditInjectionMode::Header)
         );
         assert!(!store.has_intercept_route("api.example.com:443"));
+    }
+
+    #[test]
+    fn test_requires_intercept_wildcard_credential_upstream() {
+        let routes = vec![RouteConfig {
+            prefix: "internal_api".to_string(),
+            upstream: "https://*.dev.example.net".to_string(),
+            credential_key: Some("cmd://internal_api".to_string()),
+            inject_mode: Default::default(),
+            inject_header: "Authorization".to_string(),
+            credential_format: Some("Bearer {}".to_string()),
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: Some("INTERNAL_API_TOKEN".to_string()),
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            oauth2: None,
+            aws_auth: None,
+        }];
+        let store = RouteStore::load(&routes).unwrap();
+
+        assert!(store.is_route_upstream("api.admin.dev.example.net:443"));
+        assert!(store.has_intercept_route("api.admin.dev.example.net:443"));
+        let hit = store
+            .lookup_by_upstream("api.admin.dev.example.net:443")
+            .unwrap();
+        assert_eq!(hit.0, "internal_api");
+        assert!(hit.1.requires_managed_credential);
+
+        let all = store.lookup_all_by_upstream("api.admin.dev.example.net:443");
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].0, "internal_api");
+
+        assert!(!store.is_route_upstream("dev.example.net:443"));
+        assert!(!store.has_intercept_route("api.admin.dev.example.net:8443"));
     }
 
     #[test]
@@ -786,10 +1056,12 @@ mod tests {
                 method: "GET".to_string(),
                 path: "/v1/items".to_string(),
             }],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store
@@ -816,10 +1088,12 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         assert!(store.is_route_upstream("aliased.example.com:443"));
@@ -832,27 +1106,34 @@ mod tests {
             upstream: "https://api.openai.com".to_string(),
             upstream_host_port: Some("api.openai.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
             tls_connector: None,
+            tls_client_config: None,
+            tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: true,
             managed_auth_mechanism: Some(NetworkAuditAuthMechanism::PhantomHeader),
             managed_injection_mode: Some(NetworkAuditInjectionMode::Header),
         };
-        assert!(managed.missing_managed_credential(false, false));
-        assert!(!managed.missing_managed_credential(true, false));
-        assert!(!managed.missing_managed_credential(false, true));
+        assert!(managed.missing_managed_credential(false, false, false));
+        assert!(!managed.missing_managed_credential(true, false, false));
+        assert!(!managed.missing_managed_credential(false, true, false));
+        assert!(!managed.missing_managed_credential(false, false, true));
 
         let l7_only = LoadedRoute {
             upstream: "https://internal.example.com".to_string(),
             upstream_host_port: Some("internal.example.com:443".to_string()),
             endpoint_rules: CompiledEndpointRules::compile(&[]).unwrap(),
+            endpoint_policy: CompiledEndpointPolicy::compile(None, &[]).unwrap(),
             tls_connector: None,
+            tls_client_config: None,
+            tls_config_key: None,
             requires_intercept: true,
             requires_managed_credential: false,
             managed_auth_mechanism: None,
             managed_injection_mode: None,
         };
-        assert!(!l7_only.missing_managed_credential(false, false));
+        assert!(!l7_only.missing_managed_credential(false, false, false));
     }
 
     #[test]
@@ -870,10 +1151,12 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
             oauth2: None,
+            aws_auth: None,
         }];
         let store = RouteStore::load(&routes).unwrap();
         let hit = store.lookup_by_upstream("api.openai.com:443").unwrap();
@@ -902,10 +1185,12 @@ mod tests {
                     method: "*".to_string(),
                     path: "/org-a/**".to_string(),
                 }],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
             RouteConfig {
                 prefix: "github_org_b".to_string(),
@@ -923,10 +1208,12 @@ mod tests {
                     method: "*".to_string(),
                     path: "/org-b/**".to_string(),
                 }],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
+                aws_auth: None,
             },
         ];
         let store = RouteStore::load(&routes).unwrap();
@@ -951,8 +1238,30 @@ mod tests {
         assert!(store.lookup_all_by_upstream("other.com:443").is_empty());
     }
 
-    /// Models a real multi-org GitHub profile. Mirrors the selection
-    /// loop in `tls_intercept::handle`:
+    #[derive(Debug, PartialEq)]
+    enum Selection<'a> {
+        Route(&'a str),
+        Passthrough,
+        Ambiguous(Vec<&'a str>),
+        EndpointDenied,
+    }
+
+    /// Thin adapter over the real `select_route` so tests exercise the shipping
+    /// decision rather than a mirror, flattening its outcome to a comparable enum.
+    fn select<'a>(
+        candidates: &'a [(&'a str, &'a LoadedRoute)],
+        method: &str,
+        path: &str,
+    ) -> Selection<'a> {
+        match select_route(candidates, method, path) {
+            RouteSelection::EndpointDenied => Selection::EndpointDenied,
+            RouteSelection::Ambiguous(names) => Selection::Ambiguous(names),
+            RouteSelection::Selected(Some((svc, _))) => Selection::Route(svc),
+            RouteSelection::Selected(None) => Selection::Passthrough,
+        }
+    }
+
+    /// Models a real multi-org GitHub profile. Exercises `select_route`:
     ///   1 match  → inject that route's credential
     ///   0 matches → passthrough (no credential injected)
     ///   2+ matches → ambiguous (hard-deny 403)
@@ -976,42 +1285,12 @@ mod tests {
                     method: "*".to_string(),
                     path: path.to_string(),
                 }],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
                 oauth2: None,
-            }
-        }
-
-        #[derive(Debug, PartialEq)]
-        enum Selection<'a> {
-            Route(&'a str),
-            Passthrough,
-            Ambiguous(Vec<&'a str>),
-        }
-
-        fn select<'a>(
-            candidates: &'a [(&'a str, &'a LoadedRoute)],
-            method: &str,
-            path: &str,
-        ) -> Selection<'a> {
-            let mut matches: Vec<&str> = Vec::new();
-            let mut catch_all: Option<&str> = None;
-            for (prefix, route) in candidates {
-                if route.endpoint_rules.is_empty() {
-                    if catch_all.is_none() {
-                        catch_all = Some(*prefix);
-                    }
-                } else if route.endpoint_rules.is_allowed(method, path) {
-                    matches.push(prefix);
-                }
-            }
-            if matches.len() > 1 {
-                Selection::Ambiguous(matches)
-            } else if let Some(svc) = matches.into_iter().next().or(catch_all) {
-                Selection::Route(svc)
-            } else {
-                Selection::Passthrough
+                aws_auth: None,
             }
         }
 
@@ -1034,18 +1313,14 @@ mod tests {
             select(&candidates, "GET", "/org-b/repo.git/info/refs"),
             Selection::Route("github_https_org_b")
         );
-        // Public repo (e.g. always-further/nono) → passthrough, no cred
+        // Public repo (e.g. nolabs-ai/nono) → passthrough, no cred
         assert_eq!(
-            select(&candidates, "GET", "/always-further/nono.git/info/refs"),
+            select(&candidates, "GET", "/nolabs-ai/nono.git/info/refs"),
             Selection::Passthrough
         );
         // POST to public repo → also passthrough
         assert_eq!(
-            select(
-                &candidates,
-                "POST",
-                "/always-further/nono.git/git-upload-pack"
-            ),
+            select(&candidates, "POST", "/nolabs-ai/nono.git/git-upload-pack"),
             Selection::Passthrough
         );
 
@@ -1066,8 +1341,85 @@ mod tests {
         );
         // Public repo matches only the /** catch-all → 1 match, ok
         assert_eq!(
-            select(&candidates2, "GET", "/always-further/nono.git/info/refs"),
+            select(&candidates2, "GET", "/nolabs-ai/nono.git/info/refs"),
             Selection::Route("github_https_all")
+        );
+    }
+
+    /// A credential-less `_ep_` authorization route (from `allow_domain` with
+    /// endpoints) must not shadow a credential catch-all on a path the `_ep_`
+    /// route authorizes — the token has to be injected, not silently dropped.
+    #[test]
+    fn test_route_selection_credential_catchall_not_shadowed() {
+        // `_ep_` endpoint-authorization route: no credential, scoped to /org/**.
+        let ep_route = RouteConfig {
+            prefix: "_ep_github.com".to_string(),
+            upstream: "https://github.com".to_string(),
+            endpoint_rules: vec![crate::config::EndpointRule {
+                method: "*".to_string(),
+                path: "/org/**".to_string(),
+            }],
+            ..Default::default()
+        };
+        // Credential catch-all: carries a token, no endpoint rules.
+        let cred_route = RouteConfig {
+            prefix: "github_api".to_string(),
+            upstream: "https://github.com".to_string(),
+            credential_key: Some("env://GH_TOKEN".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("GH_TOKEN".to_string()),
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[ep_route, cred_route]).unwrap();
+        let candidates = store.lookup_all_by_upstream("github.com:443");
+        assert_eq!(candidates.len(), 2);
+
+        // Authorized path (matches the _ep_ rule): the credential catch-all must
+        // win so the token is injected — not the credential-less _ep_ match.
+        assert_eq!(
+            select(&candidates, "GET", "/org/repo"),
+            Selection::Route("github_api"),
+            "credential catch-all must be selected on the _ep_-authorized path"
+        );
+        // Non-matching path: the _ep_ gate hard-denies before the catch-all is
+        // reached, so the catch-all cannot bypass endpoint restrictions.
+        assert_eq!(
+            select(&candidates, "GET", "/other/repo"),
+            Selection::EndpointDenied
+        );
+    }
+
+    /// Two credential catch-alls for the same upstream are ambiguous: the proxy
+    /// must not silently pick one to inject, just as with overlapping endpoint
+    /// credential routes.
+    #[test]
+    fn test_route_selection_dual_credential_catchall_is_ambiguous() {
+        let cred_a = RouteConfig {
+            prefix: "github_a".to_string(),
+            upstream: "https://github.com".to_string(),
+            credential_key: Some("env://GH_TOKEN_A".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("GH_TOKEN_A".to_string()),
+            ..Default::default()
+        };
+        let cred_b = RouteConfig {
+            prefix: "github_b".to_string(),
+            upstream: "https://github.com".to_string(),
+            credential_key: Some("env://GH_TOKEN_B".to_string()),
+            credential_format: Some("Bearer {}".to_string()),
+            env_var: Some("GH_TOKEN_B".to_string()),
+            ..Default::default()
+        };
+
+        let store = RouteStore::load(&[cred_a, cred_b]).unwrap();
+        let candidates = store.lookup_all_by_upstream("github.com:443");
+        assert_eq!(candidates.len(), 2);
+
+        // Both credential catch-alls cover every path → ambiguous, not a silent pick.
+        assert_eq!(
+            select(&candidates, "GET", "/any/path"),
+            Selection::Ambiguous(vec!["github_a", "github_b"])
         );
     }
 
@@ -1343,10 +1695,12 @@ h56ZLEEqHfVWFhJWIKRSabtxYPV/VJyMv+lo3L0QwSKsouHs3dtF1zVQ
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: Some(cert_path.to_str().unwrap().to_string()),
             tls_client_key: Some(key_path.to_str().unwrap().to_string()),
             oauth2: None,
+            aws_auth: None,
         }];
 
         let store = RouteStore::load(&routes).expect("should load mTLS route");

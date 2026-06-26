@@ -2,12 +2,16 @@
 //!
 //! Profiles provide named configurations for common applications like
 //! claude-code, openclaw, and opencode. They can be built-in (compiled
-//! into the binary) or user-defined (in ~/.config/nono/profiles/).
+//! into the binary) or user-defined (in `$XDG_CONFIG_HOME/nono/profiles/`).
 
 pub(crate) mod builtin;
 
+use crate::command_policy::{
+    CommandPoliciesConfig, CommandPolicyValidationScope, validate_command_policies,
+    validate_legacy_blocked_command_interactions,
+};
 use nono::{NonoError, Result};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as DeError};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -313,6 +317,10 @@ pub struct CustomCredentialDef {
     #[serde(default)]
     pub endpoint_rules: Vec<nono_proxy::config::EndpointRule>,
 
+    /// Optional explicit L7 endpoint policy with allow/deny/approve routes.
+    #[serde(default)]
+    pub endpoint_policy: Option<nono_proxy::config::EndpointPolicyConfig>,
+
     /// Optional path to a PEM-encoded CA certificate file for upstream TLS.
     ///
     /// When set, the proxy trusts this CA in addition to the system roots
@@ -340,6 +348,93 @@ pub struct CustomCredentialDef {
     /// to the certificate in `tls_client_cert`.
     #[serde(default)]
     pub tls_client_key: Option<String>,
+
+    /// Optional AWS SigV4 signing configuration.
+    ///
+    /// When present, the proxy will sign outbound requests with AWS SigV4
+    /// credentials resolved from the configured profile (or the default
+    /// credential chain). Mutually exclusive with `credential_key` and `auth`.
+    #[serde(default)]
+    pub aws_auth: Option<nono_proxy::config::AwsAuthConfig>,
+}
+
+/// Host-side command that materializes a proxy credential for `cmd://<name>`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCaptureEntry {
+    /// Command and arguments. The first element is resolved by the supervisor
+    /// before execution; no shell is used.
+    pub command: Vec<String>,
+    /// Maximum command runtime in seconds.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// In-memory cache TTL in seconds. `0` disables caching.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+    /// In-memory cache TTL in seconds. `0` disables caching. Preferred name
+    /// for new profiles; `ttl_secs` remains accepted for compatibility.
+    #[serde(default)]
+    pub cache_ttl_secs: Option<u64>,
+    /// Optional regular expression used to derive the cache scope from the
+    /// request path. The first capture group is used when present.
+    #[serde(default)]
+    pub cache_path_regex: Option<String>,
+    /// Capture command stdin mode. Defaults to `null`.
+    #[serde(default)]
+    pub stdin: CredentialCaptureStdinMode,
+    /// Capture command output mode. Defaults to text.
+    #[serde(default)]
+    pub output: CredentialCaptureOutput,
+    /// Explicit interactive affordances for browser-backed auth flows.
+    #[serde(default)]
+    pub interaction: Option<CredentialCaptureInteraction>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialCaptureStdinMode {
+    #[default]
+    Null,
+    RequestJson,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CredentialCaptureOutput {
+    Format(CredentialCaptureOutputFormat),
+    Config(CredentialCaptureOutputConfig),
+}
+
+impl Default for CredentialCaptureOutput {
+    fn default() -> Self {
+        Self::Format(CredentialCaptureOutputFormat::Text)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialCaptureOutputFormat {
+    Text,
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCaptureOutputConfig {
+    pub format: CredentialCaptureOutputFormat,
+    #[serde(default)]
+    pub allow_headers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialCaptureInteraction {
+    #[serde(default)]
+    pub stdio: bool,
+    #[serde(default)]
+    pub open_urls: Option<OpenUrlConfig>,
+    #[serde(default)]
+    pub allow_launch_services: bool,
 }
 
 fn default_inject_header() -> String {
@@ -414,6 +509,13 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
                 context_name, e
             ))
         })
+    } else if nono::keystore::is_cmd_uri(key) {
+        nono::keystore::validate_cmd_uri(key).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "invalid cmd:// URI for custom credential '{}': {}",
+                context_name, e
+            ))
+        })
     } else if nono::keystore::is_env_uri(key) {
         nono::keystore::validate_env_uri(key).map_err(|e| {
             NonoError::ProfileParse(format!(
@@ -426,7 +528,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
         if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
             return Err(NonoError::ProfileParse(format!(
                 "credential_key '{}' for custom credential '{}' must contain only \
-                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// URI)",
+                 alphanumeric characters and underscores (or use op:// / bw:// / apple-password:// / file:// / env:// / cmd:// URI)",
                 key, context_name
             )));
         }
@@ -438,7 +540,7 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///
 /// Checks:
 /// - `credential_key` must be alphanumeric + underscores only, or a valid
-///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` URI
+///   `op://` / `bw://` / `apple-password://` / `file://` / `env://` / `cmd://` URI
 /// - `upstream` must be HTTPS (or HTTP for loopback only)
 /// - Mode-specific validation:
 ///   - `header`: inject_header must be valid HTTP token; effective format (see field doc) must not contain CR/LF
@@ -446,6 +548,15 @@ fn validate_credential_key(context_name: &str, key: &str) -> Result<()> {
 ///   - `query_param`: query_param_name required, valid query param name
 ///   - `basic_auth`: no additional required fields
 fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<()> {
+    // Mutual exclusion: aws_auth is incompatible with credential_key and auth.
+    if cred.aws_auth.is_some() && (cred.credential_key.is_some() || cred.auth.is_some()) {
+        return Err(NonoError::ProfileParse(format!(
+            "custom credential '{}' has 'aws_auth' set together with 'credential_key' or 'auth'; \
+             aws_auth is mutually exclusive with both — remove the other auth field",
+            name
+        )));
+    }
+
     // Mutual exclusion: credential_key and auth cannot both be set
     if cred.credential_key.is_some() && cred.auth.is_some() {
         return Err(NonoError::ProfileParse(format!(
@@ -455,10 +566,10 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         )));
     }
 
-    // At least one of credential_key or auth must be set
-    if cred.credential_key.is_none() && cred.auth.is_none() {
+    // At least one of credential_key, auth, or aws_auth must be set
+    if cred.credential_key.is_none() && cred.auth.is_none() && cred.aws_auth.is_none() {
         return Err(NonoError::ProfileParse(format!(
-            "custom credential '{}' must have either 'credential_key' or 'auth' set",
+            "custom credential '{}' must have either 'credential_key', 'auth', or 'aws_auth' set",
             name
         )));
     }
@@ -466,6 +577,11 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
     // Validate OAuth2 auth if present
     if let Some(ref auth) = cred.auth {
         validate_oauth2_auth(name, auth)?;
+    }
+
+    // Validate aws_auth if present
+    if let Some(ref aws) = cred.aws_auth {
+        validate_aws_auth(name, aws)?;
     }
 
     // Validate credential_key if present
@@ -478,12 +594,13 @@ fn validate_custom_credential(name: &str, cred: &CustomCredentialDef) -> Result<
         if (nono::keystore::is_op_uri(key)
             || nono::keystore::is_bw_uri(key)
             || nono::keystore::is_apple_password_uri(key)
-            || nono::keystore::is_file_uri(key))
+            || nono::keystore::is_file_uri(key)
+            || nono::keystore::is_cmd_uri(key))
             && cred.env_var.is_none()
         {
             return Err(NonoError::ProfileParse(format!(
                 "env_var is required for custom credential '{}' when credential_key is a URI \
-                 manager reference (op://, bw://, apple-password://, or file://); \
+                 manager reference (op://, bw://, apple-password://, file://, or cmd://); \
                  set it to the SDK API key env var name (e.g., \"OPENAI_API_KEY\")",
                 name
             )));
@@ -687,6 +804,51 @@ fn validate_oauth2_auth(name: &str, auth: &OAuth2Config) -> Result<()> {
     Ok(())
 }
 
+/// Validate AWS SigV4 signing configuration subfields.
+///
+/// - `profile`: non-empty, no whitespace (whitespace breaks the AWS INI config
+///   parser; see aws/aws-cli#2806). Mixed case is allowed — profile names are
+///   case-sensitive.
+/// - `region` / `service`: non-empty, lowercase, no whitespace. The SigV4
+///   credential scope requires lowercase region and service codes.
+fn validate_aws_auth(name: &str, aws: &nono_proxy::config::AwsAuthConfig) -> Result<()> {
+    if let Some(ref profile) = aws.profile
+        && (profile.is_empty() || profile.contains(char::is_whitespace))
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "aws_auth.profile for custom credential '{}' must be a non-empty string \
+             with no whitespace; omit the field to use the default credential chain",
+            name
+        )));
+    }
+
+    if let Some(ref region) = aws.region
+        && (region.is_empty()
+            || region.contains(char::is_whitespace)
+            || region.chars().any(|c| c.is_uppercase()))
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "aws_auth.region for custom credential '{}' must be a non-empty, \
+             lowercase string with no whitespace (e.g., \"us-east-1\")",
+            name
+        )));
+    }
+
+    if let Some(ref service) = aws.service
+        && (service.is_empty()
+            || service.contains(char::is_whitespace)
+            || service.chars().any(|c| c.is_uppercase()))
+    {
+        return Err(NonoError::ProfileParse(format!(
+            "aws_auth.service for custom credential '{}' must be a non-empty, \
+             lowercase string with no whitespace (e.g., \"bedrock\", \"s3\")",
+            name
+        )));
+    }
+
+    Ok(())
+}
+
 /// Validate header injection mode fields.
 fn validate_header_mode(name: &str, cred: &CustomCredentialDef) -> Result<()> {
     // Validate inject_header (RFC 7230 token)
@@ -849,6 +1011,241 @@ fn validate_profile_custom_credentials(profile: &Profile) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_open_url_config(config: &OpenUrlConfig) -> Result<()> {
+    for origin in &config.allow_origins {
+        if origin.trim().is_empty() || origin.contains('\0') {
+            return Err(NonoError::ProfileParse(
+                "open_urls.allow_origins entries must be non-empty and must not contain NUL"
+                    .to_string(),
+            ));
+        }
+        let parsed = url::Url::parse(origin).map_err(|e| {
+            NonoError::ProfileParse(format!(
+                "open_urls.allow_origins entry '{origin}' is not a valid URL origin: {e}"
+            ))
+        })?;
+        if parsed.scheme() != "https" && parsed.scheme() != "http" {
+            return Err(NonoError::ProfileParse(format!(
+                "open_urls.allow_origins entry '{origin}' must use http or https"
+            )));
+        }
+        if parsed.host_str().is_none() {
+            return Err(NonoError::ProfileParse(format!(
+                "open_urls.allow_origins entry '{origin}' must include a host"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_credential_capture_entries(profile: &Profile) -> Result<()> {
+    for (name, entry) in &profile.credential_capture {
+        if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' must contain only alphanumeric characters and underscores"
+            )));
+        }
+        if entry.command.is_empty() {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' must include a non-empty command array"
+            )));
+        }
+        for part in &entry.command {
+            if part.is_empty() || part.contains('\0') {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' contains an empty or NUL-bearing command argument"
+                )));
+            }
+        }
+        if matches!(entry.timeout_secs, Some(0)) {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' timeout_secs must be greater than zero"
+            )));
+        }
+        if entry.timeout_secs.is_some_and(|secs| secs > 300) {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' timeout_secs must be <= 300"
+            )));
+        }
+        if entry.ttl_secs.is_some_and(|secs| secs > 3600) {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' ttl_secs must be <= 3600"
+            )));
+        }
+        if entry.cache_ttl_secs.is_some_and(|secs| secs > 3600) {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' cache_ttl_secs must be <= 3600"
+            )));
+        }
+        if entry.ttl_secs.is_some()
+            && entry.cache_ttl_secs.is_some()
+            && entry.ttl_secs != entry.cache_ttl_secs
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' must not set conflicting ttl_secs and cache_ttl_secs values"
+            )));
+        }
+        if let Some(pattern) = &entry.cache_path_regex {
+            if pattern.is_empty() || pattern.contains('\0') {
+                return Err(NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' cache_path_regex must be non-empty and must not contain NUL"
+                )));
+            }
+            regex::Regex::new(pattern).map_err(|err| {
+                NonoError::ProfileParse(format!(
+                    "credential_capture entry '{name}' cache_path_regex is invalid: {err}"
+                ))
+            })?;
+        }
+        let output_format = match &entry.output {
+            CredentialCaptureOutput::Format(format) => *format,
+            CredentialCaptureOutput::Config(config) => {
+                if config.format != CredentialCaptureOutputFormat::Json {
+                    return Err(NonoError::ProfileParse(format!(
+                        "credential_capture entry '{name}' output object form is only supported with format json"
+                    )));
+                }
+                if config.format == CredentialCaptureOutputFormat::Json
+                    && config.allow_headers.is_empty()
+                {
+                    return Err(NonoError::ProfileParse(format!(
+                        "credential_capture entry '{name}' output.allow_headers must be non-empty when output.format is json"
+                    )));
+                }
+                for header in &config.allow_headers {
+                    if !is_safe_capture_header_name(header) {
+                        return Err(NonoError::ProfileParse(format!(
+                            "credential_capture entry '{name}' output.allow_headers contains invalid or forbidden HTTP header name '{header}'"
+                        )));
+                    }
+                }
+                config.format
+            }
+        };
+        if output_format == CredentialCaptureOutputFormat::Json
+            && matches!(entry.output, CredentialCaptureOutput::Format(_))
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "credential_capture entry '{name}' output json must use object form with allow_headers"
+            )));
+        }
+        if let Some(interaction) = &entry.interaction
+            && let Some(open_urls) = &interaction.open_urls
+        {
+            validate_open_url_config(open_urls)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn is_safe_capture_header_name(name: &str) -> bool {
+    if name.is_empty() || !name.chars().all(is_http_token_char) {
+        return false;
+    }
+    !matches!(
+        name.to_ascii_lowercase().as_str(),
+        "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "keep-alive"
+    )
+}
+
+fn validate_credential_capture_references(profile: &Profile) -> Result<()> {
+    for (route_name, cred) in &profile.network.custom_credentials {
+        let Some(key) = cred.credential_key.as_deref() else {
+            continue;
+        };
+        if !nono::keystore::is_cmd_uri(key) {
+            continue;
+        }
+        let name = key.strip_prefix("cmd://").unwrap_or("");
+        let Some(entry) = profile.credential_capture.get(name) else {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{route_name}' references '{key}' but credential_capture.{name} is not defined"
+            )));
+        };
+        if credential_capture_entry_output_format(entry) == CredentialCaptureOutputFormat::Json
+            && !matches!(cred.inject_mode, InjectMode::Header | InjectMode::BasicAuth)
+        {
+            return Err(NonoError::ProfileParse(format!(
+                "custom credential '{route_name}' uses credential_capture.{name} JSON output, which is only supported with header-style injection"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn credential_capture_entry_output_format(
+    entry: &CredentialCaptureEntry,
+) -> CredentialCaptureOutputFormat {
+    match &entry.output {
+        CredentialCaptureOutput::Format(format) => *format,
+        CredentialCaptureOutput::Config(config) => config.format,
+    }
+}
+
+fn validate_credential_capture_resolved(profile: &Profile) -> Result<()> {
+    validate_credential_capture_entries(profile)?;
+    validate_credential_capture_references(profile)
+}
+
+fn validate_profile_tls_intercept(profile: &Profile) -> Result<()> {
+    let Some(tls) = &profile.network.tls_intercept else {
+        return Ok(());
+    };
+    if let Some(value) = &tls.ca_validity {
+        parse_tls_duration("network.tls_intercept.ca_validity", value)?;
+    }
+    if let Some(value) = &tls.leaf_validity {
+        parse_tls_duration("network.tls_intercept.leaf_validity", value)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_tls_duration(field: &str, value: &str) -> Result<std::time::Duration> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(NonoError::ProfileParse(format!(
+            "{field} must not be empty"
+        )));
+    }
+    let (number, multiplier) = match value.as_bytes().last().copied() {
+        Some(b's') => (&value[..value.len() - 1], 1_u64),
+        Some(b'm') => (&value[..value.len() - 1], 60_u64),
+        Some(b'h') => (&value[..value.len() - 1], 60 * 60),
+        Some(b'd') => (&value[..value.len() - 1], 24 * 60 * 60),
+        Some(byte) if byte.is_ascii_digit() => (value, 1_u64),
+        _ => {
+            return Err(NonoError::ProfileParse(format!(
+                "{field} must be a positive duration like 30s, 15m, 24h, or 1d"
+            )));
+        }
+    };
+    let amount = number.parse::<u64>().map_err(|_| {
+        NonoError::ProfileParse(format!(
+            "{field} must be a positive duration like 30s, 15m, 24h, or 1d"
+        ))
+    })?;
+    if amount == 0 {
+        return Err(NonoError::ProfileParse(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    let secs = amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| NonoError::ProfileParse(format!("{field} is too large: {value}")))?;
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 /// Validate env_credentials keys in a profile.
 ///
 /// Keys can be keyring account names, `op://` URIs, `bw://` URIs,
@@ -1006,6 +1403,11 @@ pub struct NetworkConfig {
     /// Canonical profile key: `block`.
     #[serde(default)]
     pub block: bool,
+    /// Allow HTTP/2 to upstream servers via ALPN negotiation.
+    /// When `false` (default), the proxy negotiates HTTP/1.1 with keep-alive
+    /// connection pooling. Equivalent to the `--allow-http2` CLI flag.
+    #[serde(default)]
+    pub allow_http2: bool,
     /// Network proxy profile name (from network-policy.json).
     /// When set, outbound traffic is filtered through the proxy.
     ///
@@ -1061,6 +1463,9 @@ pub struct NetworkConfig {
     /// how to route and inject credentials for that service.
     #[serde(default)]
     pub custom_credentials: HashMap<String, CustomCredentialDef>,
+    /// TLS interception controls for L7 proxy routes.
+    #[serde(default)]
+    pub tls_intercept: Option<TlsInterceptConfig>,
     /// Upstream proxy address (host:port) for enterprise proxy passthrough.
     /// Canonical profile key: `upstream_proxy` (legacy `external_proxy`
     /// accepted).
@@ -1075,6 +1480,25 @@ pub struct NetworkConfig {
     pub upstream_bypass: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsInterceptConfig {
+    #[serde(default)]
+    pub ca_lifecycle: TlsCaLifecycle,
+    #[serde(default)]
+    pub ca_validity: Option<String>,
+    #[serde(default)]
+    pub leaf_validity: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsCaLifecycle {
+    #[default]
+    Session,
+    Trusted,
+}
+
 impl NetworkConfig {
     pub fn resolved_network_profile(&self) -> Option<&str> {
         self.network_profile.as_ref().map(String::as_str)
@@ -1083,14 +1507,6 @@ impl NetworkConfig {
     /// Returns the resolved credentials list, defaulting to empty if unset.
     pub fn resolved_credentials(&self) -> &[String] {
         self.credentials.as_deref().unwrap_or(&[])
-    }
-
-    /// Whether any profile setting requires proxy mode activation.
-    pub fn has_proxy_flags(&self) -> bool {
-        self.resolved_network_profile().is_some()
-            || !self.allow_domain.is_empty()
-            || !self.resolved_credentials().is_empty()
-            || self.upstream_proxy.is_some()
     }
 }
 
@@ -1490,7 +1906,7 @@ pub struct EnvironmentConfig {
     /// Maps variable names to values, set after allow/deny filtering and before
     /// credential injection (so injected credentials win on conflict). Values
     /// support the same expansion as profile paths (`$HOME`, `~`, `$WORKDIR`,
-    /// `$TMPDIR`, `$XDG_*`, `$NONO_PACKAGES`).
+    /// `$TMPDIR`, `$XDG_*`, `$NONO_CONFIG`, `$NONO_PACKAGES`).
     ///
     /// `PATH` and any `NONO_*` key are reserved and rejected at parse time.
     /// Unlike inherited host variables, keys here are NOT subject to the
@@ -1505,7 +1921,7 @@ pub struct EnvironmentConfig {
 /// Controls which URLs the sandboxed child can request the supervisor to
 /// open in the user's browser. Used for OAuth2 login flows and similar
 /// operations where the sandboxed process cannot launch a browser directly.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenUrlConfig {
     /// Allowed URL origins (scheme + host, e.g., "https://console.anthropic.com").
@@ -1551,6 +1967,24 @@ where
     })
 }
 
+fn deserialize_command_policies<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<CommandPoliciesConfig>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Err(D::Error::custom(
+            "command_policies cannot be null; omit the field or use an empty object",
+        ));
+    };
+
+    CommandPoliciesConfig::deserialize(value)
+        .map(Some)
+        .map_err(D::Error::custom)
+}
+
 /// A complete profile definition
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Profile {
@@ -1581,6 +2015,10 @@ pub struct Profile {
     pub env_credentials: SecretsConfig,
     #[serde(default)]
     pub environment: Option<EnvironmentConfig>,
+    #[serde(default)]
+    pub command_policies: Option<CommandPoliciesConfig>,
+    #[serde(default)]
+    pub credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
     pub workdir: WorkdirConfig,
     #[serde(default)]
@@ -1681,6 +2119,10 @@ struct ProfileDeserialize {
     env_credentials: SecretsConfig,
     #[serde(default)]
     environment: Option<EnvironmentConfig>,
+    #[serde(default, deserialize_with = "deserialize_command_policies")]
+    command_policies: Option<CommandPoliciesConfig>,
+    #[serde(default)]
+    credential_capture: HashMap<String, CredentialCaptureEntry>,
     #[serde(default)]
     workdir: WorkdirConfig,
     #[serde(default)]
@@ -1732,6 +2174,8 @@ impl From<ProfileDeserialize> for Profile {
             linux: raw.linux,
             env_credentials: raw.env_credentials,
             environment: raw.environment,
+            command_policies: raw.command_policies,
+            credential_capture: raw.credential_capture,
             workdir: raw.workdir,
             hooks: raw.hooks,
             session_hooks: raw.session_hooks,
@@ -1771,7 +2215,7 @@ impl<'de> Deserialize<'de> for Profile {
 
 /// Check whether a profile name is loaded from a user file rather than the built-in set.
 ///
-/// Returns `true` when a user profile file exists at `~/.config/nono/profiles/<name>.json`,
+/// Returns `true` when a user profile file exists at `$XDG_CONFIG_HOME/nono/profiles/<name>.json`,
 /// which means the user has overridden or shadowed any built-in profile of the same name.
 pub fn is_user_override(name: &str) -> bool {
     if !is_valid_profile_name(name) {
@@ -1841,7 +2285,7 @@ pub fn load_profile_extends(name_or_path: &str) -> Option<Vec<String>> {
 /// treated as a direct file path. Otherwise it is resolved as a profile name.
 ///
 /// Name loading precedence:
-/// 1. User profiles from `~/.config/nono/profiles/<name>.json` — never written
+/// 1. User profiles from `$XDG_CONFIG_HOME/nono/profiles/<name>.json` — never written
 ///    by nono. Users (and Claude's "Option B" guidance) own this directory.
 /// 2. Pack-store scan — any installed pack with a profile artifact whose
 ///    `install_as` matches the requested name. Self-heals Claude Code plugin
@@ -2269,8 +2713,22 @@ pub(crate) fn load_raw_profile_from_path(path: &Path) -> Result<Profile> {
 }
 
 /// Resolve inheritance and apply implicit default-group merging for a raw profile.
+#[allow(deprecated)]
 pub(crate) fn finalize_profile(mut profile: Profile) -> Result<Profile> {
     merge_implicit_default_groups(&mut profile)?;
+    validate_credential_capture_resolved(&profile)?;
+    validate_profile_tls_intercept(&profile)?;
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Resolved,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.commands.deny,
+        &profile.commands.allow,
+    )
+    .into_result()?;
     Ok(profile)
 }
 
@@ -2337,6 +2795,7 @@ fn parse_profile_file(path: &Path) -> Result<Profile> {
     parse_profile_bytes(&content)
 }
 
+#[allow(deprecated)]
 pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     let text = std::str::from_utf8(content)
         .map_err(|e| NonoError::ProfileParse(format!("invalid UTF-8: {e}")))?;
@@ -2345,6 +2804,8 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
 
     // Validate custom credentials for security issues
     validate_profile_custom_credentials(&profile)?;
+    validate_credential_capture_entries(&profile)?;
+    validate_profile_tls_intercept(&profile)?;
 
     // Validate env_credentials keys (URI entries need structural validation)
     validate_env_credential_keys(&profile)?;
@@ -2356,6 +2817,18 @@ pub(crate) fn parse_profile_bytes(content: &[u8]) -> Result<Profile> {
     {
         return Err(NonoError::ProfileParse(err));
     }
+
+    validate_command_policies(
+        profile.command_policies.as_ref(),
+        CommandPolicyValidationScope::Syntax,
+    )
+    .into_result()?;
+    validate_legacy_blocked_command_interactions(
+        profile.command_policies.as_ref(),
+        &profile.commands.deny,
+        &profile.commands.allow,
+    )
+    .into_result()?;
 
     Ok(profile)
 }
@@ -2652,6 +3125,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
         },
         network: NetworkConfig {
             block: base.network.block || child.network.block,
+            allow_http2: base.network.allow_http2 || child.network.allow_http2,
             network_profile: child
                 .network
                 .network_profile
@@ -2685,6 +3159,7 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                 merged.extend(child.network.custom_credentials);
                 merged
             },
+            tls_intercept: child.network.tls_intercept.or(base.network.tls_intercept),
             // Child overrides base upstream proxy; if child has None, inherit base
             upstream_proxy: child.network.upstream_proxy.or(base.network.upstream_proxy),
             upstream_bypass: dedup_append(
@@ -2724,6 +3199,12 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
                     merged
                 },
             }),
+        },
+        command_policies: merge_command_policies(&base.command_policies, &child.command_policies),
+        credential_capture: {
+            let mut merged = base.credential_capture;
+            merged.extend(child.credential_capture);
+            merged
         },
         // NOTE: WorkdirAccess::None serves as both "not specified" and "explicitly no access".
         // A child cannot override a base's workdir grant to None. This is a v1 limitation;
@@ -2772,6 +3253,18 @@ fn merge_profiles(base: Profile, child: Profile) -> Profile {
             &base.unsafe_macos_seatbelt_rules,
             &child.unsafe_macos_seatbelt_rules,
         ),
+    }
+}
+
+fn merge_command_policies(
+    base: &Option<CommandPoliciesConfig>,
+    child: &Option<CommandPoliciesConfig>,
+) -> Option<CommandPoliciesConfig> {
+    match (base, child) {
+        (None, None) => None,
+        (Some(base), None) => Some(base.clone()),
+        (None, Some(child)) => Some(child.clone()),
+        (Some(base), Some(child)) => Some(base.merge_child(child)),
     }
 }
 
@@ -2848,13 +3341,30 @@ pub(crate) fn resolve_user_profile_path(name: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn user_profile_dir() -> Result<PathBuf> {
-    Ok(resolve_user_config_dir()?.join("nono").join("profiles"))
+    Ok(crate::package::nono_config_dir()?.join("profiles"))
+}
+
+/// Display hint for `$XDG_CONFIG_HOME/nono` when runtime resolution fails.
+pub const NONO_CONFIG_DIR_HINT: &str = "$XDG_CONFIG_HOME/nono (default ~/.config/nono)";
+
+/// Resolved user profile directory for user-facing output.
+#[must_use]
+pub fn display_user_profiles_dir() -> String {
+    user_profile_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| format!("{NONO_CONFIG_DIR_HINT}/profiles"))
+}
+
+/// Resolved user trust-policy path for user-facing output.
+#[must_use]
+pub fn display_trust_policy_path() -> String {
+    crate::package::nono_config_dir()
+        .map(|p| p.join("trust-policy.json").display().to_string())
+        .unwrap_or_else(|_| format!("{NONO_CONFIG_DIR_HINT}/trust-policy.json"))
 }
 
 pub(crate) fn user_profile_draft_dir() -> Result<PathBuf> {
-    Ok(resolve_user_config_dir()?
-        .join("nono")
-        .join("profile-drafts"))
+    Ok(crate::package::nono_config_dir()?.join("profile-drafts"))
 }
 
 pub(crate) fn get_user_profile_draft_path(name: &str) -> Result<PathBuf> {
@@ -2929,6 +3439,7 @@ pub(crate) fn is_valid_profile_name(name: &str) -> bool {
 /// - $WORKDIR: Working directory (--workdir or cwd)
 /// - $HOME: User's home directory
 /// - $XDG_CONFIG_HOME: XDG config directory
+/// - $NONO_CONFIG: nono config root (`$XDG_CONFIG_HOME/nono`)
 /// - $XDG_DATA_HOME: XDG data directory
 /// - $XDG_STATE_HOME: XDG state directory
 /// - $XDG_CACHE_HOME: XDG cache directory
@@ -3013,7 +3524,11 @@ pub fn expand_vars(path: &str, workdir: &Path) -> Result<PathBuf> {
         expanded = expanded.replace("$XDG_RUNTIME_DIR", rt);
     }
 
-    // Expand $NONO_PACKAGES to the package store directory
+    // Expand $NONO_CONFIG / $NONO_PACKAGES to resolved nono config paths
+    if expanded.contains("$NONO_CONFIG") {
+        let config_dir = crate::package::nono_config_dir()?;
+        expanded = expanded.replace("$NONO_CONFIG", &config_dir.to_string_lossy());
+    }
     if expanded.contains("$NONO_PACKAGES") {
         let packages_dir = crate::package::package_store_dir()?;
         expanded = expanded.replace("$NONO_PACKAGES", &packages_dir.to_string_lossy());
@@ -3193,6 +3708,50 @@ mod tests {
         assert_eq!(profile.commands.deny, vec!["docker"]);
     }
 
+    #[test]
+    fn test_network_tls_intercept_deserializes() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "tls_intercept": {
+                    "ca_lifecycle": "trusted",
+                    "ca_validity": "24h",
+                    "leaf_validity": "15m"
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json).expect("parse");
+        let tls = profile
+            .network
+            .tls_intercept
+            .expect("tls_intercept should parse");
+        assert_eq!(tls.ca_lifecycle, TlsCaLifecycle::Trusted);
+        assert_eq!(tls.ca_validity.as_deref(), Some("24h"));
+        assert_eq!(tls.leaf_validity.as_deref(), Some("15m"));
+        assert_eq!(
+            parse_tls_duration("test", tls.leaf_validity.as_deref().unwrap_or_default()).unwrap(),
+            std::time::Duration::from_secs(15 * 60)
+        );
+    }
+
+    #[test]
+    fn test_network_tls_intercept_rejects_invalid_duration() {
+        let json = br#"{
+            "meta": {"name": "t"},
+            "network": {
+                "tls_intercept": {
+                    "ca_validity": "forever"
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("invalid duration should fail");
+        assert!(
+            err.to_string()
+                .contains("network.tls_intercept.ca_validity"),
+            "{err}"
+        );
+    }
+
     // Note: in-process unit tests covering the drain (legacy → canonical)
     // live in `crates/nono-cli/tests/legacy_drain_unit_tests.rs` so the
     // legacy JSON literals stay confined to a path the lint-docs script
@@ -3285,6 +3844,49 @@ mod tests {
         _env.remove("XDG_STATE_HOME");
         let expanded = expand_vars("$XDG_STATE_HOME/history", &workdir).expect("valid env");
         assert_eq!(expanded, PathBuf::from("/home/user/.local/state/history"));
+    }
+
+    #[test]
+    fn test_expand_vars_xdg_config_home() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("XDG_CONFIG_HOME", "/custom/config"),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/custom/config/nono/profiles"));
+
+        _env.remove("XDG_CONFIG_HOME");
+        let expanded = expand_vars("$XDG_CONFIG_HOME/nono/profiles", &workdir).expect("valid env");
+        assert_eq!(expanded, PathBuf::from("/home/user/.config/nono/profiles"));
+    }
+
+    #[test]
+    fn test_expand_vars_nono_config() {
+        let _guard = match crate::test_env::ENV_LOCK.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_home = tmp.path().join("config");
+        std::fs::create_dir_all(&config_home).expect("create config home");
+        let config_home_str = config_home.to_string_lossy().to_string();
+        let _env = crate::test_env::EnvVarGuard::set_all(&[
+            ("HOME", "/home/user"),
+            ("XDG_CONFIG_HOME", &config_home_str),
+        ]);
+
+        let workdir = PathBuf::from("/projects/myapp");
+        let expanded = expand_vars("$NONO_CONFIG/profiles", &workdir).expect("valid env");
+        assert_eq!(
+            nono::try_canonicalize(&expanded),
+            nono::try_canonicalize(&config_home.join("nono").join("profiles"))
+        );
     }
 
     #[test]
@@ -3930,9 +4532,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         }
     }
 
@@ -4094,9 +4698,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4116,9 +4722,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("missing path_pattern should be rejected");
@@ -4140,9 +4748,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("pattern without {} should be rejected");
@@ -4164,9 +4774,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("telegram", &cred).is_ok());
     }
@@ -4186,9 +4798,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("telegram", &cred);
         let err = result.expect_err("replacement without {} should be rejected");
@@ -4210,9 +4824,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("google_maps", &cred).is_ok());
     }
@@ -4232,9 +4848,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("missing query_param_name should be rejected");
@@ -4256,9 +4874,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("google_maps", &cred);
         let err = result.expect_err("empty query_param_name should be rejected");
@@ -4280,9 +4900,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         // BasicAuth mode doesn't require additional fields
         // Credential value is expected to be "username:password" format
@@ -4481,9 +5103,11 @@ mod tests {
             proxy: None,
             env_var: None,
             endpoint_rules: vec![],
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         }
     }
 
@@ -4695,6 +5319,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Set("base-net".to_string()),
                 allow_domain: vec![AllowDomainEntry::Plain("base.example.com".to_string())],
                 open_port: vec![3000],
@@ -4702,6 +5327,7 @@ mod tests {
                 connect_port: vec![],
                 credentials: Some(vec!["base_cred".to_string()]),
                 custom_credentials: HashMap::new(),
+                tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
@@ -4715,6 +5341,8 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
+            credential_capture: HashMap::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::ReadWrite,
             },
@@ -4776,6 +5404,7 @@ mod tests {
             },
             network: NetworkConfig {
                 block: false,
+                allow_http2: false,
                 network_profile: InheritableValue::Inherit,
                 allow_domain: vec![AllowDomainEntry::Plain("child.example.com".to_string())],
                 open_port: vec![3000, 5000],
@@ -4783,6 +5412,7 @@ mod tests {
                 connect_port: vec![],
                 credentials: None,
                 custom_credentials: HashMap::new(),
+                tls_intercept: None,
                 upstream_proxy: None,
                 upstream_bypass: Vec::new(),
             },
@@ -4796,6 +5426,8 @@ mod tests {
                 },
             },
             environment: None,
+            command_policies: None,
+            credential_capture: HashMap::new(),
             workdir: WorkdirConfig {
                 access: WorkdirAccess::None,
             },
@@ -5045,9 +5677,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5067,9 +5701,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5207,9 +5843,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5229,9 +5867,11 @@ mod tests {
                 proxy: None,
                 env_var: None,
                 endpoint_rules: vec![],
+                endpoint_policy: None,
                 tls_ca: None,
                 tls_client_cert: None,
                 tls_client_key: None,
+                aws_auth: None,
             },
         );
 
@@ -5773,16 +6413,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_none_does_not_activate_proxy() {
-        let mut config = NetworkConfig::default();
-        assert!(!config.has_proxy_flags()); // None = no proxy
-        config.credentials = Some(Vec::new());
-        assert!(!config.has_proxy_flags()); // Some([]) = no proxy
-        config.credentials = Some(vec!["openai".to_string()]);
-        assert!(config.has_proxy_flags()); // Some(["openai"]) = proxy
-    }
-
-    #[test]
     fn test_credentials_deserialization_absent_vs_empty() {
         // Absent field → None (inherit)
         let json = r#"{ "meta": { "name": "no-creds" }, "network": {} }"#;
@@ -6148,6 +6778,23 @@ mod tests {
     }
 
     #[test]
+    fn test_command_policies_null_rejected() {
+        let result: std::result::Result<Profile, _> = serde_json::from_str(
+            r#"{
+                "meta": { "name": "null-command-policies" },
+                "command_policies": null
+            }"#,
+        );
+
+        assert!(result.is_err());
+        let err = result.expect_err("command_policies null should be rejected");
+        assert!(
+            err.to_string().contains("command_policies cannot be null"),
+            "error should describe null rejection: {err}"
+        );
+    }
+
+    #[test]
     fn test_unknown_fields_rejected_in_profile() {
         // A typo like "add_deny_acces" (missing 's') must be caught at parse
         // time. For a security tool, silently discarding unknown keys means a
@@ -6396,7 +7043,8 @@ mod tests {
 
         let profile = load_profile_from_path(&profile_path).expect("load profile");
         assert_eq!(profile.network.resolved_network_profile(), None);
-        assert!(!profile.network.has_proxy_flags());
+        assert!(profile.network.resolved_credentials().is_empty());
+        assert!(profile.network.allow_domain.is_empty());
         assert!(
             profile
                 .filesystem
@@ -6653,6 +7301,99 @@ mod tests {
     }
 
     #[test]
+    fn test_schema_validates_tool_sandbox_edge_policy() {
+        let json = r#"{
+            "meta": {
+                "name": "tool-sandbox-edge-test"
+            },
+            "command_policies": {
+                "approval_backends": {
+                    "human": {
+                        "type": "terminal"
+                    }
+                },
+                "approval_defaults": {
+                    "backend": "human",
+                    "timeout_secs": 30
+                },
+                "credentials": {
+                    "github-api": {
+                        "type": "proxy",
+                        "upstream": "https://api.github.com",
+                        "credential_key": "env://GH_TOKEN",
+                        "env_var": "GH_TOKEN",
+                        "inject_header": "Authorization",
+                        "credential_format": "Bearer {}"
+                    }
+                },
+                "commands": {
+                    "gh": {
+                        "from": {
+                            "session": {
+                                "sandbox": {
+                                    "fs_read": ["."],
+                                    "credentials": [
+                                        {
+                                            "name": "github-api",
+                                            "endpoint_policy": {
+                                                "default": "deny",
+                                                "allow": [
+                                                    {
+                                                        "method": "GET",
+                                                        "path": "/repos/nolabs-ai/nono/issues"
+                                                    }
+                                                ]
+                                            }
+                                        }
+                                    ],
+                                    "network": {
+                                        "allow_domain": ["api.github.com"]
+                                    },
+                                    "stdio": {
+                                        "stdout": {
+                                            "max_bytes": 1048576,
+                                            "on_limit": "truncate"
+                                        }
+                                    }
+                                },
+                                "invocation_policy": {
+                                    "default": "deny",
+                                    "approve": [
+                                        {
+                                            "argv": {
+                                                "prefix": ["issue", "comment"]
+                                            },
+                                            "backend": "human",
+                                            "timeout_secs": 10
+                                        }
+                                    ],
+                                    "allow": [
+                                        {
+                                            "argv": {
+                                                "prefix": ["issue", "view"]
+                                            },
+                                            "env": {
+                                                "GH_HOST": {
+                                                    "equals": "github.com"
+                                                }
+                                            },
+                                            "reason": "agents may view GitHub issues"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }"#;
+        validate_against_schema(json)
+            .expect("documented tool-sandbox edge policy should pass schema validation");
+        serde_json::from_str::<Profile>(json)
+            .expect("documented tool-sandbox edge policy should parse as a profile");
+    }
+
+    #[test]
     fn test_schema_validates_builtin_profiles_in_policy_json() {
         // Validate that all built-in profiles in policy.json conform to the schema
         let policy_str = include_str!("../../data/policy.json");
@@ -6694,9 +7435,11 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(
             validate_custom_credential("example", &cred).is_ok(),
@@ -6719,9 +7462,11 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI without env_var should be rejected");
@@ -6747,9 +7492,11 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         let err = result.expect_err("file:// URI with relative path should be rejected");
@@ -6775,9 +7522,11 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: Some("EXAMPLE_API_KEY".to_string()),
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(
@@ -6835,11 +7584,153 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         assert!(validate_custom_credential("example", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_custom_credential_requires_capture_entry() {
+        let json = r#"{
+            "meta": { "name": "cmd-creds" },
+            "network": {
+                "credentials": ["github"],
+                "custom_credentials": {
+                    "github": {
+                        "upstream": "https://api.github.com",
+                        "credential_key": "cmd://github",
+                        "env_var": "GH_TOKEN"
+                    }
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("missing capture should reject");
+        assert!(
+            err.to_string().contains("credential_capture.github"),
+            "error should mention missing capture entry: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_custom_credential_accepts_capture_entry() {
+        let json = r#"{
+            "meta": { "name": "cmd-creds" },
+            "network": {
+                "credentials": ["github"],
+                "custom_credentials": {
+                    "github": {
+                        "upstream": "https://api.github.com",
+                        "credential_key": "cmd://github",
+                        "env_var": "GH_TOKEN"
+                    }
+                }
+            },
+            "credential_capture": {
+                "github": {
+                    "command": ["/bin/echo", "token"],
+                    "timeout_secs": 5,
+                    "ttl_secs": 0
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("cmd capture profile parses");
+        assert!(profile.credential_capture.contains_key("github"));
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_capture_rejects_invalid_cache_regex() {
+        let json = br#"{
+            "meta": { "name": "cmd-creds" },
+            "credential_capture": {
+                "github": {
+                    "command": ["/bin/echo", "token"],
+                    "cache_path_regex": "["
+                }
+            }
+        }"#;
+        let err = parse_profile_bytes(json).expect_err("invalid cache regex should reject");
+        assert!(
+            err.to_string().contains("cache_path_regex is invalid"),
+            "error should mention invalid cache regex: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_json_output_requires_header_style_route() {
+        let json = r#"{
+            "meta": { "name": "cmd-creds" },
+            "network": {
+                "credentials": ["github"],
+                "custom_credentials": {
+                    "github": {
+                        "upstream": "https://api.github.com",
+                        "credential_key": "cmd://github",
+                        "env_var": "GH_TOKEN",
+                        "inject_mode": "query_param",
+                        "query_param_name": "token"
+                    }
+                }
+            },
+            "credential_capture": {
+                "github": {
+                    "command": ["/bin/echo", "{\"headers\":{\"Authorization\":\"Bearer token\"}}"],
+                    "output": {
+                        "format": "json",
+                        "allow_headers": ["Authorization"]
+                    }
+                }
+            }
+        }"#;
+        let profile = parse_profile_bytes(json.as_bytes()).expect("raw profile parses");
+        let err = finalize_profile(profile).expect_err("json output should reject query route");
+        assert!(
+            err.to_string().contains("header-style injection"),
+            "error should mention header-style injection: {err}"
+        );
+    }
+
+    #[test]
+    fn test_profile_cmd_uri_custom_credential_accepts_inherited_capture_entry() {
+        let dir = tempdir().expect("tmpdir");
+        std::fs::write(
+            dir.path().join("base.json"),
+            r#"{
+                "meta": { "name": "base" },
+                "credential_capture": {
+                    "github": {
+                        "command": ["/bin/echo", "token"]
+                    }
+                }
+            }"#,
+        )
+        .expect("write base");
+        let child_path = dir.path().join("child.json");
+        std::fs::write(
+            &child_path,
+            r#"{
+                "extends": "base",
+                "meta": { "name": "child" },
+                "network": {
+                    "credentials": ["github"],
+                    "custom_credentials": {
+                        "github": {
+                            "upstream": "https://api.github.com",
+                            "credential_key": "cmd://github",
+                            "env_var": "GH_TOKEN"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("write child");
+
+        let profile = load_from_file(&child_path).expect("inherited cmd capture resolves");
+        assert!(profile.credential_capture.contains_key("github"));
     }
 
     #[test]
@@ -6857,9 +7748,11 @@ mod tests {
             proxy: None,
             endpoint_rules: vec![],
             env_var: None,
+            endpoint_policy: None,
             tls_ca: None,
             tls_client_cert: None,
             tls_client_key: None,
+            aws_auth: None,
         };
         let result = validate_custom_credential("example", &cred);
         assert!(result.is_err(), "env://LD_PRELOAD should be rejected");
@@ -7625,5 +8518,414 @@ mod tests {
             Some("/usr/bin/inherited"),
             "child without binary should inherit from base"
         );
+    }
+
+    // ========================================================================
+    // aws_auth validation tests
+    // ========================================================================
+
+    fn aws_auth_cred_builder() -> CustomCredentialDef {
+        CustomCredentialDef {
+            upstream: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            credential_key: None,
+            auth: None,
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: None,
+            }),
+            inject_mode: InjectMode::Header,
+            inject_header: "Authorization".to_string(),
+            credential_format: None,
+            path_pattern: None,
+            path_replacement: None,
+            query_param_name: None,
+            proxy: None,
+            env_var: None,
+            endpoint_rules: vec![],
+            endpoint_policy: None,
+            tls_ca: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+        }
+    }
+
+    #[test]
+    fn test_aws_auth_minimal_valid() {
+        let cred = aws_auth_cred_builder();
+        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_all_fields_valid() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("my-aws-profile".to_string()),
+                region: Some("us-east-1".to_string()),
+                service: Some("bedrock".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_with_http_upstream_rejected() {
+        // AWS routes require HTTPS just like any other credential type.
+        let cred = CustomCredentialDef {
+            upstream: "http://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("https") || msg.contains("HTTPS"),
+            "error should mention https requirement, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_mutually_exclusive_with_credential_key() {
+        let cred = CustomCredentialDef {
+            credential_key: Some("my_aws_key".to_string()),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("aws_auth"),
+            "error should mention aws_auth, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_mutually_exclusive_with_auth_oauth2() {
+        let cred = CustomCredentialDef {
+            auth: Some(OAuth2Config {
+                token_url: "https://auth.example.com/token".to_string(),
+                client_id: "cid".to_string(),
+                client_secret: "env://SECRET".to_string(),
+                scope: String::new(),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("aws_auth"),
+            "error should mention aws_auth, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_none_of_three_rejected() {
+        let cred = CustomCredentialDef {
+            credential_key: None,
+            auth: None,
+            aws_auth: None,
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("credential_key") || msg.contains("auth") || msg.contains("aws_auth"),
+            "error should mention the missing auth fields, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_empty_profile_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some(String::new()),
+                region: None,
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("profile"),
+            "error should mention profile, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_empty_region_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: Some(String::new()),
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("region"),
+            "error should mention region, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_empty_service_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: Some(String::new()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service"),
+            "error should mention service, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_region_with_whitespace_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: Some("us east-1".to_string()),
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("region"),
+            "error should mention region, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_service_with_whitespace_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: Some("bed rock".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service"),
+            "error should mention service, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_serde_roundtrip_in_custom_cred_def() {
+        let json = r#"{
+            "upstream": "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "aws_auth": {
+                "profile": "my-aws-profile",
+                "region": "us-east-1",
+                "service": "bedrock"
+            }
+        }"#;
+        let cred: CustomCredentialDef = serde_json::from_str(json).unwrap();
+        let aws = cred.aws_auth.as_ref().unwrap();
+        assert_eq!(aws.profile.as_deref(), Some("my-aws-profile"));
+        assert_eq!(aws.region.as_deref(), Some("us-east-1"));
+        assert_eq!(aws.service.as_deref(), Some("bedrock"));
+
+        // Roundtrip
+        let serialized = serde_json::to_string(&cred).unwrap();
+        let deserialized: CustomCredentialDef = serde_json::from_str(&serialized).unwrap();
+        let aws2 = deserialized.aws_auth.unwrap();
+        assert_eq!(aws2.profile.as_deref(), Some("my-aws-profile"));
+    }
+
+    // --- profile whitespace rejection ---
+
+    #[test]
+    fn test_aws_auth_profile_with_space_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("my profile".to_string()),
+                region: None,
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("profile"),
+            "error should mention profile, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_profile_with_tab_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("my\tprofile".to_string()),
+                region: None,
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("profile"),
+            "error should mention profile, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_profile_mixed_case_valid() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: Some("MyCompany-Prod".to_string()),
+                region: None,
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("bedrock", &cred).is_ok());
+    }
+
+    // --- region lowercase enforcement ---
+
+    #[test]
+    fn test_aws_auth_region_uppercase_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: Some("US-EAST-1".to_string()),
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("region"),
+            "error should mention region, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_region_mixed_case_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: Some("Us-East-1".to_string()),
+                service: None,
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("region"),
+            "error should mention region, got: {}",
+            msg
+        );
+    }
+
+    // --- service lowercase enforcement ---
+
+    #[test]
+    fn test_aws_auth_service_uppercase_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: Some("Bedrock".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service"),
+            "error should mention service, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_service_all_caps_rejected() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: Some("S3".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        let result = validate_custom_credential("bedrock", &cred);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("service"),
+            "error should mention service, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_aws_auth_service_with_hyphen_valid() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: None,
+                service: Some("workers-ai".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("cf", &cred).is_ok());
+    }
+
+    #[test]
+    fn test_aws_auth_execute_api_service_valid() {
+        let cred = CustomCredentialDef {
+            aws_auth: Some(nono_proxy::config::AwsAuthConfig {
+                profile: None,
+                region: Some("ap-southeast-2".to_string()),
+                service: Some("execute-api".to_string()),
+            }),
+            ..aws_auth_cred_builder()
+        };
+        assert!(validate_custom_credential("apigw", &cred).is_ok());
     }
 }

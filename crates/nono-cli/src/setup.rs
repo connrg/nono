@@ -181,7 +181,7 @@ impl SetupRunner {
                   1. Check your kernel config: CONFIG_SECURITY_LANDLOCK=y\n\
                   2. Add to boot params: lsm=landlock,lockdown,yama,integrity,apparmor\n\
                   3. Reboot your system\n\n\
-                See: https://github.com/always-further/nono/docs/troubleshooting.md#landlock-not-supported",
+                See: https://github.com/nolabs-ai/nono/docs/troubleshooting.md#landlock-not-supported",
                 e
             )))?;
 
@@ -404,15 +404,14 @@ impl SetupRunner {
 
             if self.generate_profiles {
                 println!("Custom profiles:");
-                let profile_dir = crate::profile::resolve_user_config_dir()
-                    .map(|p| p.join("nono").join("profiles"))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "~/.config/nono/profiles".to_string());
-                println!("  Edit example profiles in: {}", profile_dir);
+                println!(
+                    "  Edit example profiles in: {}",
+                    crate::profile::display_user_profiles_dir()
+                );
                 println!();
             }
 
-            println!("Documentation: https://github.com/always-further/nono#readme");
+            println!("Documentation: https://github.com/nolabs-ai/nono#readme");
             println!();
             println!("Run 'nono run --help' to see all options.");
         }

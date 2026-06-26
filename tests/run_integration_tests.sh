@@ -52,8 +52,8 @@ echo -e "Platform: $(uname -s) $(uname -m)"
 echo ""
 
 # Make test scripts executable
-chmod +x "$SCRIPT_DIR"/integration/*.sh
-chmod +x "$SCRIPT_DIR"/lib/*.sh
+chmod +x "$SCRIPT_DIR"/integration/*.sh 2>/dev/null || true
+chmod +x "$SCRIPT_DIR"/lib/*.sh 2>/dev/null || true
 
 # =============================================================================
 # Run Test Suites in Parallel (with concurrency limit)
@@ -156,6 +156,7 @@ SUITES=(
     "test_client_startup.sh:Client Startup"
     "test_silent_output.sh:Silent Output"
     "test_env_sanitization.sh:Env Sanitization"
+    "test_child_tool_boundaries.sh:Child / Tool Boundaries"
     "test_exec_strategy.sh:Exec Strategy"
     "test_trust_cli.sh:Trust CLI"
     "test_audit.sh:Audit Trail"
