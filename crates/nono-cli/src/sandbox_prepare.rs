@@ -582,11 +582,10 @@ fn finalize_prepared_sandbox(
     args: &SandboxArgs,
     silent: bool,
 ) -> Result<PreparedSandbox> {
-    // Attach resource limits from CLI flags. The manifest path already populated
-    // caps via `CapabilitySet::try_from`, and flags conflict with `--config`
-    // (clap `conflicts_with`), so this branch only runs on the flag path. Enforcement
-    // happens later in the supervised runtime; here we just attach the parsed
-    // limits to the capability set (also shown in `--dry-run`).
+    // Attach resource limits from CLI flags. The manifest path already set caps via
+    // `CapabilitySet::try_from`, and flags conflict with `--config`, so this only
+    // runs on the flag path. Enforcement is later, in the supervised runtime; here
+    // we just attach the parsed limits to the capability set (also in --dry-run).
     if let Some(ref s) = args.memory {
         let memory_bytes = nono::resource::parse_size(s)?;
         prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
@@ -594,12 +593,11 @@ fn finalize_prepared_sandbox(
         });
     }
 
-    // SECURITY: a memory cap is enforced through cgroup control files under
-    // /sys/fs/cgroup. If the sandbox is ALSO granted write access over any part
-    // of that tree, the child could rewrite its own memory.max (or migrate to a
-    // cgroup it creates) and silently defeat the cap. Landlock is allow-list and
-    // cannot carve the cgroup tree out of a broad grant like `/sys`, so refuse
-    // the run rather than enforce a cap the sandbox can lift.
+    // SECURITY: the memory cap lives in cgroup control files under /sys/fs/cgroup.
+    // Write access to any part of that tree lets the child rewrite its own
+    // memory.max (or migrate to a cgroup it makes) and defeat the cap. Landlock is
+    // allow-list and can't carve the cgroup tree out of a broad grant like `/sys`,
+    // so refuse the run rather than enforce a cap the sandbox can lift.
     reject_cgroup_writable_grants_under_memory_limit(&prepared.caps)?;
 
     output::print_skipped_requested_paths(&collect_missing_cli_requested_paths(args), silent);
@@ -633,12 +631,11 @@ fn finalize_prepared_sandbox(
 }
 
 /// True when a filesystem grant gives the sandbox WRITE access over any part of
-/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) — the control plane that enforces
-/// `--memory`. Dangerous whichever way the paths nest: the grant is inside the
-/// cgroup tree, or it is a broad ancestor (e.g. `/sys`, `/`) that contains it.
-/// Read-only grants are safe — defeating the cap requires writing the limit
-/// knobs or `cgroup.procs`. Uses component-based `Path::starts_with`, never a
-/// string prefix, so `/sys/fs/cgroupX` does not match `/sys/fs/cgroup`.
+/// the cgroup v2 hierarchy (`/sys/fs/cgroup`) that enforces `--memory`. Dangerous
+/// either way the paths nest: the grant is inside the tree, or a broad ancestor
+/// (`/sys`, `/`) containing it. Read-only is safe — defeating the cap needs
+/// writing the knobs or `cgroup.procs`. Component-based `Path::starts_with`, not a
+/// string prefix, so `/sys/fs/cgroupX` doesn't match `/sys/fs/cgroup`.
 fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool {
     if !matches!(access, AccessMode::Write | AccessMode::ReadWrite) {
         return false;
@@ -647,11 +644,10 @@ fn grant_opens_cgroup_control_plane(resolved: &Path, access: AccessMode) -> bool
     resolved.starts_with(cgroup_mount) || cgroup_mount.starts_with(resolved)
 }
 
-/// Refuse a run whose `--memory` cap could be silently defeated because the
-/// sandbox is also granted write access over the cgroup hierarchy enforcing it
-/// (the child could raise its own `memory.max` or migrate out of the leaf).
-///
-/// Only fires when a memory limit is actually set; a no-limit run is unaffected.
+/// Refuse a run whose `--memory` cap could be defeated because the sandbox is also
+/// granted write access over the cgroup hierarchy enforcing it (the child could
+/// raise its own `memory.max` or migrate out of the leaf). Only fires when a
+/// memory limit is set.
 fn reject_cgroup_writable_grants_under_memory_limit(caps: &CapabilitySet) -> Result<()> {
     if caps
         .resource_limits()

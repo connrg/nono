@@ -1,22 +1,19 @@
 //! Resource limits — parsed, validated ceilings for a sandboxed process tree.
 //!
-//! This is the internal, enforcement-facing type; the schema-generated
-//! [`crate::manifest`] types are the on-disk contract. (Same split as
-//! [`crate::capability::CapabilitySet`] vs the manifest.)
-//!
-//! This module defines the limits and parses them from human-friendly CLI
-//! input; config, serialization, and `--dry-run` carry them end-to-end.
-//! Enforcement lives in the CLI supervisor (`nono-cli`'s `resource_cgroup`),
-//! which renders these values to cgroup v2 knobs on Linux — keeping the
-//! library policy-free.
+//! The internal, enforcement-facing type; the schema-generated [`crate::manifest`]
+//! types are the on-disk contract (same split as
+//! [`crate::capability::CapabilitySet`] vs the manifest). This module defines and
+//! parses the limits from human-friendly CLI input. Enforcement lives in the CLI
+//! supervisor (`nono-cli`'s `resource_cgroup`), which renders them to cgroup v2
+//! knobs on Linux — keeping the library policy-free.
 
 use crate::error::{NonoError, Result};
 use serde::{Deserialize, Serialize};
 
-/// Parsed, validated resource ceilings. `None` means "no limit" for that
-/// dimension. Values are raw bytes / counts — human-friendly sizes such as
-/// `512M` are parsed at the CLI boundary via [`parse_size`], never stored as
-/// strings, so the manifest stays a fully-resolved machine contract.
+/// Parsed, validated resource ceilings; `None` means "no limit". Values are raw
+/// bytes/counts — sizes like `512M` are parsed at the CLI boundary via
+/// [`parse_size`], never stored as strings, so the manifest stays a
+/// fully-resolved machine contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// Maximum resident memory for the process tree, in bytes
@@ -26,8 +23,8 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// True when no ceiling is set. Used to decide whether to display limits or
-    /// require a supervised run.
+    /// True when no ceiling is set. Decides whether to show limits or require a
+    /// supervised run.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.memory_bytes.is_none()
@@ -45,14 +42,14 @@ impl ResourceLimits {
 
 /// Parse a human-friendly size string into a byte count.
 ///
-/// Accepts an integer followed by an optional unit suffix (case-insensitive):
-/// bare / `B` = bytes; `K`/`KiB`/`Ki`, `M`/`MiB`/`Mi`, `G`/`GiB`/`Gi`,
-/// `T`/`TiB`/`Ti` are binary (1024-based); `KB`/`MB`/`GB`/`TB` are decimal
-/// (1000-based). Examples: `512M` → 536870912, `1Gi` → 1073741824.
+/// An integer plus an optional unit suffix (case-insensitive): bare/`B` = bytes;
+/// `K`/`Ki`/`KiB`, `M`/`Mi`/`MiB`, `G`/`Gi`/`GiB`, `T`/`Ti`/`TiB` are binary
+/// (1024-based); `KB`/`MB`/`GB`/`TB` are decimal (1000-based). E.g. `512M` →
+/// 536870912, `1Gi` → 1073741824.
 ///
-/// Returns [`NonoError::ConfigParse`] on an empty string, missing number,
-/// non-integer mantissa, unknown unit, overflow, or a zero result (a limit of
-/// zero is rejected rather than silently meaning "unlimited").
+/// [`NonoError::ConfigParse`] on empty input, missing number, non-integer,
+/// unknown unit, overflow, or zero (a zero limit is rejected, not read as
+/// "unlimited").
 pub fn parse_size(input: &str) -> Result<u64> {
     let s = input.trim();
     if s.is_empty() {
@@ -103,7 +100,7 @@ pub fn parse_size(input: &str) -> Result<u64> {
 /// Format a byte count with binary units for display (e.g. `512.0 MiB`).
 ///
 /// Shared by [`ResourceLimits::summary`] and the CLI's failure diagnostics so a
-/// limit and the memory that breached it are rendered the same way everywhere.
+/// limit and the memory that breached it render the same everywhere.
 #[must_use]
 #[allow(clippy::cast_precision_loss)]
 pub fn format_bytes(bytes: u64) -> String {
@@ -219,9 +216,8 @@ mod tests {
 
     #[test]
     fn parse_size_unit_overflow_boundaries_per_unit() {
-        // For each multiplier, the largest value that still fits in u64 must parse,
-        // and the next integer up must be rejected as overflow. This pins the
-        // checked_mul boundary exactly rather than just "some huge value fails".
+        // For each multiplier, the largest u64-fitting value must parse and the
+        // next integer up must overflow — pinning the checked_mul boundary exactly.
 
         // K / Ki / KiB multiplier = 1024. u64::MAX / 1024 = 18014398509481983.
         assert_eq!(
@@ -273,10 +269,9 @@ mod tests {
 
     #[test]
     fn format_bytes_via_summary_exact_boundaries() {
-        // format_bytes is private; exercise it through ResourceLimits::summary(),
-        // which prepends "memory=". Pin the exact rendering at the unit boundaries,
-        // the sub-KiB whole-byte branch, a TiB value, the unit cap, and a rounding
-        // case.
+        // format_bytes is private; exercise it via summary() (which prepends
+        // "memory="). Pin the rendering at unit boundaries, the sub-KiB whole-byte
+        // branch, a TiB value, the unit cap, and a rounding case.
         let mem = |b: u64| {
             ResourceLimits {
                 memory_bytes: Some(b),
@@ -307,9 +302,9 @@ mod tests {
 
     #[test]
     fn parse_size_format_bytes_roundtrip_on_exact_binary_values() {
-        // For values that are an exact, single-unit binary multiple, summary()'s
-        // rendered form re-parses (via parse_size) back to the same byte count:
-        // a closed loop proving the human-facing units and the parser agree.
+        // For exact single-unit binary multiples, summary()'s rendered form
+        // re-parses back to the same byte count: a closed loop proving the units
+        // and the parser agree.
         for (bytes, unit) in [
             (1024_u64, "KiB"),
             (512 * 1024, "KiB"),
@@ -355,9 +350,9 @@ mod tests {
 
     #[test]
     fn none_memory_serializes_to_empty_object_with_no_key() {
-        // skip_serializing_if = "Option::is_none": a None ceiling must produce an
-        // empty JSON object, not `{"memory_bytes":null}`. This is the on-disk
-        // contract that keeps legacy/None states forward-compatible.
+        // skip_serializing_if = "Option::is_none": a None ceiling must produce `{}`,
+        // not `{"memory_bytes":null}` — the on-disk contract that keeps None states
+        // forward-compatible.
         let none = ResourceLimits::default();
         assert_eq!(serde_json::to_string(&none).unwrap(), "{}");
 
@@ -369,9 +364,8 @@ mod tests {
 
     #[test]
     fn empty_and_null_object_deserialize_to_none() {
-        // The inverse of the skip-serialize contract: an absent field (`{}`) and an
-        // explicit `null` both deserialize back to None via #[serde(default)], so a
-        // state written by an older build round-trips cleanly.
+        // Inverse of the skip-serialize contract: both `{}` and explicit `null`
+        // deserialize to None via #[serde(default)], so older-build state round-trips.
         let from_empty: ResourceLimits = serde_json::from_str("{}").unwrap();
         assert!(from_empty.memory_bytes.is_none());
         assert!(from_empty.is_empty());
@@ -382,10 +376,9 @@ mod tests {
 
     #[test]
     fn some_memory_serializes_with_exactly_one_key_and_roundtrips() {
-        // Some(N) must serialize to exactly { "memory_bytes": N } — one key, the
-        // right value — and survive a round-trip. (The existing roundtrip test
-        // would still pass if a stray key leaked in, since serde ignores unknown
-        // fields on the way back; this pins the exact serialized shape.)
+        // Some(N) must serialize to exactly { "memory_bytes": N } and round-trip.
+        // (The roundtrip test would miss a stray leaked key — serde ignores unknown
+        // fields on read — so this pins the exact serialized shape.)
         let some = ResourceLimits {
             memory_bytes: Some(536_870_912),
         };

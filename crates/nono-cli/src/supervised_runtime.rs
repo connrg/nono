@@ -290,11 +290,11 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         tool_sandbox_runtime: config.tool_sandbox_runtime,
     };
 
-    // Resource enforcement: Linux cgroup v2. A requested limit creates the leaf
-    // pre-fork; if no delegated cgroup v2 subtree is available, `CgroupLeaf::create`
-    // errors and the run fails closed rather than execute the limit unenforced.
-    // The child self-attaches to the leaf (see `resource_procs_fd` below);
-    // dropping `cgroup_leaf` tears it down.
+    // Resource enforcement (Linux cgroup v2): a requested limit creates the leaf
+    // pre-fork. With no delegated cgroup v2 subtree, `CgroupLeaf::create` errors and
+    // the run fails closed rather than run the limit unenforced. The child
+    // self-attaches (see `resource_procs_fd` below); dropping `cgroup_leaf` tears it
+    // down.
     #[cfg(target_os = "linux")]
     let cgroup_leaf = match caps.resource_limits() {
         Some(limits) if !limits.is_empty() => {
@@ -317,38 +317,36 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     }
 
     // The fd the child self-attaches through: opened in the parent so the forked
-    // child inherits it and can cage itself before it can fork/exec, closing the
-    // post-fork race a parent-side attach would leave open. The leaf (and thus the
-    // fd) lives to the end of this function.
+    // child inherits it and cages itself before it can fork/exec — closing the
+    // post-fork race a parent-side attach would leave open. The leaf (and fd) live
+    // to the end of this function.
     #[cfg(target_os = "linux")]
     let resource_procs_fd = cgroup_leaf.as_ref().map(|leaf| leaf.procs_raw_fd());
     #[cfg(not(target_os = "linux"))]
     let resource_procs_fd: Option<std::os::fd::RawFd> = None;
 
     let exit_code = {
-        // Runs in the parent the instant the child is forked, with the child's
-        // pid; records it on the session. The cgroup attach is the child's own
-        // job (see `resource_procs_fd` above), so there is no parent-side escape
-        // window to close here.
+        // Runs in the parent the instant the child is forked, with the child's pid;
+        // records it on the session. The cgroup attach is the child's own job (see
+        // `resource_procs_fd` above), so there's no parent-side escape window here.
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
             }
         };
 
-        // Post-mortem hook, installed only when a resource cgroup leaf exists.
-        // The kernel OOM-kills the sandbox for crossing a memory cap as a bare
-        // SIGKILL (exit 137) with no explanation; the hook reads the leaf's OOM
-        // evidence while it still exists and prints a precise diagnostic, so a
-        // cap breach is loud rather than silent. Returning `true` suppresses the
-        // generic "killed by SIGKILL" footer.
+        // Post-mortem hook, installed only when a resource cgroup leaf exists. A
+        // memory-cap breach arrives as a bare SIGKILL (exit 137) with no
+        // explanation; the hook reads the leaf's OOM evidence while it still exists
+        // and prints a precise diagnostic, so the breach is loud not silent.
+        // Returning `true` suppresses the generic "killed by SIGKILL" footer.
         #[cfg(target_os = "linux")]
         let mut on_exit_diag_fn = |code: i32| -> bool {
-            // Only explain the exit code the kernel delivers when the whole
-            // sandbox is OOM-killed for crossing the cap (128 + SIGKILL = 137).
-            // Bailing on any other code stops an unrelated failure from getting a
-            // spurious "killed by the kernel" story, or its real footer suppressed,
-            // just because a single descendant was OOM-reaped earlier in the run.
+            // Only explain the kernel's exit code for a whole-sandbox OOM kill
+            // (128 + SIGKILL = 137). Bailing on any other code stops an unrelated
+            // failure from getting a spurious "killed by the kernel" story (or its
+            // real footer suppressed) just because one descendant was OOM-reaped
+            // earlier.
             const OOM_SIGKILL_EXIT: i32 = 128 + nix::libc::SIGKILL;
             if code != OOM_SIGKILL_EXIT {
                 return false;

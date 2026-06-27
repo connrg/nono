@@ -486,11 +486,10 @@ pub fn execute_supervised(
     // pre-fork. When set, the forked child self-attaches through it before
     // applying the sandbox or exec'ing. Unused off Linux.
     resource_procs_fd: Option<std::os::fd::RawFd>,
-    // Optional post-mortem hook, called once with the child's exit code after it
-    // is reaped. It may print a specialized diagnostic (e.g. the resource
-    // cgroup's memory-cap explanation). Returning `true` means it fully explained
-    // the failure, so the generic exit/denial footer is suppressed instead of
-    // telling the user two competing stories.
+    // Optional post-mortem hook, called once with the child's exit code after
+    // reaping. It may print a specialized diagnostic (e.g. the cgroup memory-cap
+    // explanation); returning `true` means it fully explained the failure, so the
+    // generic exit/denial footer is suppressed (no two competing stories).
     mut on_exit_diagnostic: Option<&mut dyn FnMut(i32) -> bool>,
 ) -> Result<i32> {
     // Used only by the Linux self-attach path below; silence the unused-var
@@ -892,12 +891,11 @@ pub fn execute_supervised(
                 unsafe { crate::pty_proxy::setup_child_pty(slave_fd) };
             }
 
-            // Resource cgroup self-attach. Before applying its sandbox or
-            // exec'ing, the child writes its own pid into the leaf cgroup via the
-            // fd inherited from the parent. Doing it here — before the child can
-            // fork or exec anything — caps the whole process tree by construction
-            // and closes the post-fork escape window a parent-side attach would
-            // leave open.
+            // Resource cgroup self-attach: before sandboxing or exec'ing, the child
+            // writes its own pid into the leaf via the inherited fd. Doing it here —
+            // before it can fork or exec — caps the whole tree by construction and
+            // closes the post-fork escape window a parent-side attach would leave
+            // open.
             #[cfg(target_os = "linux")]
             if let Some(procs_fd) = resource_procs_fd
                 && !crate::resource_cgroup::child_self_attach(procs_fd)

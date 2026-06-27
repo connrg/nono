@@ -72,9 +72,9 @@ impl CapabilityManifest {
             }
         }
 
-        // Resource ceilings are enforced by the supervising parent, so they
-        // require exec_strategy: "supervised". An empty `resources` object carries
-        // no actual limit, so it is a no-op and does not trigger the requirement.
+        // Resource ceilings are enforced by the supervising parent, so they require
+        // exec_strategy: "supervised". An empty `resources` object carries no limit,
+        // so it's a no-op and doesn't trigger the requirement.
         if let Some(ref res) = self.resources
             && res.memory_bytes.is_some()
         {
@@ -200,11 +200,10 @@ mod resource_tests {
 
     #[test]
     fn resources_rejects_removed_cpu_and_procs_keys() {
-        // The memory-only contract: cpu_max_percent and max_procs were removed from
-        // the Resources schema. Because Resources is additionalProperties:false
-        // (generated as #[serde(deny_unknown_fields)]), a manifest still carrying
-        // either must fail to PARSE — proving the removal is enforced by the schema,
-        // not silently ignored at runtime.
+        // Memory-only contract: cpu_max_percent and max_procs were removed from the
+        // Resources schema. Since Resources is additionalProperties:false
+        // (deny_unknown_fields), a manifest still carrying either must fail to PARSE
+        // — the removal is enforced by the schema, not ignored at runtime.
         let with_cpu = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "supervised" },
@@ -235,10 +234,9 @@ mod resource_tests {
 
     #[test]
     fn resources_unknown_key_alongside_valid_memory_fails_whole_manifest() {
-        // A correct memory_bytes does not rescue an unknown sibling key: the whole
-        // manifest must fail (additionalProperties:false / deny_unknown_fields on
-        // Resources). This guards against a typo'd limit being silently dropped
-        // while the rest of the manifest is accepted.
+        // A correct memory_bytes doesn't rescue an unknown sibling key: the whole
+        // manifest must fail (deny_unknown_fields on Resources). Guards against a
+        // typo'd limit being dropped while the rest of the manifest is accepted.
         let json = r#"{
             "version": "0.1.0",
             "process": { "exec_strategy": "supervised" },
@@ -252,9 +250,9 @@ mod resource_tests {
 
     #[test]
     fn resources_rejects_zero_and_negative_memory_via_schema_minimum() {
-        // schema minimum:1 is generated as Option<NonZeroU64>, so a zero or negative
-        // ceiling fails at parse time — a limit of 0 can never be mistaken for
-        // "unlimited", and a negative number can never fit an unsigned ceiling.
+        // schema minimum:1 generates Option<NonZeroU64>, so a zero or negative
+        // ceiling fails at parse time — 0 can't be mistaken for "unlimited", and a
+        // negative can't fit an unsigned ceiling.
         let zero = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 0 } }"#;
         assert!(
             CapabilityManifest::from_json(zero).is_err(),
@@ -270,11 +268,10 @@ mod resource_tests {
 
     #[test]
     fn validate_memory_unsupervised_yields_configparse_variant() {
-        // memory_bytes present + default (monitor) strategy: validate() must reject
-        // specifically via the public NonoError::ConfigParse variant (the same error
-        // surface the CLI relies on for a clean message). The reject/accept/no-op
-        // behaviour itself is covered by resources_require_supervised /
-        // empty_resources_is_a_noop; this pins the variant.
+        // memory_bytes + default (monitor) strategy: validate() must reject via the
+        // public NonoError::ConfigParse variant (the surface the CLI relies on for a
+        // clean message). The reject/accept/no-op behaviour is covered elsewhere;
+        // this pins the variant.
         let unsupervised = r#"{ "version": "0.1.0", "resources": { "memory_bytes": 1024 } }"#;
         let manifest = CapabilityManifest::from_json(unsupervised).expect("parse");
         let err = manifest

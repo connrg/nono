@@ -20,9 +20,9 @@ pub struct SandboxState {
     pub unix_sockets: Vec<UnixSocketCapState>,
     /// Whether network is blocked
     pub net_blocked: bool,
-    /// Resource ceilings (currently memory). Absent in states persisted by
-    /// older nono builds; `#[serde(default)]` preserves backward compat.
-    /// These are plain numbers, so unlike paths they need no re-validation.
+    /// Resource ceilings (currently memory). Absent in states from older nono
+    /// builds; `#[serde(default)]` keeps those loadable. Plain numbers, so unlike
+    /// paths they need no re-validation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_limits: Option<ResourceLimits>,
 }
@@ -270,9 +270,8 @@ mod tests {
             });
         let state = SandboxState::from_caps(&caps);
 
-        // The serialized state must nest the exact memory_bytes value at
-        // resource_limits.memory_bytes (the existing roundtrip test checks the
-        // value survives; this pins the on-disk JSON shape).
+        // The serialized state must nest memory_bytes at resource_limits.memory_bytes
+        // (the roundtrip test checks the value survives; this pins the JSON shape).
         let json = state.to_json().expect("serialize");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let inner = v
@@ -287,8 +286,7 @@ mod tests {
         // An older state JSON (predating these fields) has neither
         // resource_limits nor unix_sockets.
         // #[serde(default)] on both must fill them in (None / empty) without error
-        // — this is the backward-compat guarantee for states on disk from older
-        // nono builds.
+        // — the backward-compat guarantee for on-disk states from older builds.
         let json = r#"{ "fs": [], "net_blocked": true }"#;
         let state = SandboxState::from_json(json).expect("legacy state loads");
         assert!(state.resource_limits.is_none(), "absent field -> None");

@@ -238,10 +238,10 @@ pub(crate) fn run_shell(args: ShellArgs, silent: bool) -> Result<()> {
 }
 
 /// `nono wrap` execs the target directly (no supervising parent), so it never
-/// creates the cgroup that enforces a memory ceiling. Accepting a limit here
-/// would run unenforced — or, under `--dry-run`, advertise a cap we won't honor.
-/// Fail closed instead, like the proxy / AF_UNIX guards below. Covers both `--memory` and a
-/// manifest `resources.memory_bytes`, since both have landed in `caps` by now.
+/// creates the cgroup that enforces a memory ceiling. Accepting a limit here would
+/// run unenforced — or under `--dry-run` advertise a cap we won't honor. Fail
+/// closed instead, like the proxy / AF_UNIX guards below. Covers both `--memory`
+/// and a manifest `resources.memory_bytes` (both are in `caps` by now).
 fn reject_resource_limits_under_wrap(caps: &CapabilitySet) -> Result<()> {
     if caps
         .resource_limits()
