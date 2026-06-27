@@ -587,7 +587,7 @@ fn finalize_prepared_sandbox(
     // runs on the flag path. Enforcement is later, in the supervised runtime; here
     // we just attach the parsed limits to the capability set (also in --dry-run).
     if let Some(ref s) = args.memory {
-        let memory_bytes = nono::resource::parse_size(s)?;
+        let memory_bytes = parse_memory_limit_flag(s)?;
         prepared.caps = prepared.caps.with_resource_limits(nono::ResourceLimits {
             memory_bytes: Some(memory_bytes),
         });
@@ -628,6 +628,36 @@ fn finalize_prepared_sandbox(
     info!("{}", Sandbox::support_info().details);
 
     Ok(prepared)
+}
+
+/// Smallest `--memory` ceiling the CLI accepts. A bare number is bytes, so
+/// `--memory 512` means 512 B — which OOM-kills any real process the instant it
+/// starts, almost always a unit slip for `512M`. Refuse anything below this floor
+/// with a hint instead of silently enforcing an unusable cap. (Manifests carry an
+/// already-resolved byte count guarded by the schema's `minimum: 1`.)
+const MIN_MEMORY_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Parse the `--memory` flag and reject implausibly small ceilings (see
+/// [`MIN_MEMORY_LIMIT_BYTES`]). Surfaces the parse error for malformed sizes.
+fn parse_memory_limit_flag(s: &str) -> Result<u64> {
+    let bytes = nono::resource::parse_size(s)?;
+    if bytes < MIN_MEMORY_LIMIT_BYTES {
+        let digits: String = s
+            .trim()
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        let hint = if digits.is_empty() {
+            "use a size unit like M or G (e.g. 512M, 2G)".to_string()
+        } else {
+            format!("a bare number is bytes — did you mean {digits}M? use a unit like M or G")
+        };
+        return Err(NonoError::ConfigParse(format!(
+            "--memory {s} is {}, below the 1 MiB minimum; {hint}",
+            nono::resource::format_bytes(bytes)
+        )));
+    }
+    Ok(bytes)
 }
 
 /// True when a filesystem grant gives the sandbox WRITE access over any part of
@@ -2070,6 +2100,30 @@ mod tests {
             memory_bytes: Some(64 * 1024 * 1024),
         });
         assert!(reject_cgroup_writable_grants_under_memory_limit(&caps).is_ok());
+    }
+
+    #[test]
+    fn memory_flag_rejects_below_one_mib_with_unit_hint() {
+        // Bare bytes that are almost certainly a unit slip for 512M.
+        let err = parse_memory_limit_flag("512").expect_err("512 B must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("1 MiB minimum"), "msg: {msg}");
+        assert!(msg.contains("512M"), "should echo the unit form: {msg}");
+
+        // Sub-MiB even with a unit is refused (512K = 512 KiB).
+        assert!(parse_memory_limit_flag("512K").is_err());
+        // The floor itself and anything above it are accepted.
+        assert_eq!(
+            parse_memory_limit_flag("1M").expect("1 MiB is at the floor"),
+            1024 * 1024
+        );
+        assert_eq!(
+            parse_memory_limit_flag("512M").expect("512M is well above the floor"),
+            512 * 1024 * 1024
+        );
+        // Malformed sizes still surface the parser's error.
+        assert!(parse_memory_limit_flag("abc").is_err());
+        assert!(parse_memory_limit_flag("0").is_err());
     }
 
     fn empty_prepared() -> PreparedSandbox {

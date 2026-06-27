@@ -69,13 +69,19 @@ pub fn print_capabilities(
     rule();
 
     // Resource limits: shown here; enforcement happens in the supervised runtime.
+    // Spell out that it's a hard cap so the user knows a breach kills the run,
+    // not just throttles it.
     if let Some(limits) = caps.resource_limits()
         && !limits.is_empty()
     {
         eprintln!(
-            "  {} {}",
+            "  {} {} {}",
             theme::fg("resources", t.yellow).bold(),
             theme::fg(&limits.summary(), t.subtext),
+            theme::fg(
+                "(hard cap — the process tree is killed if it exceeds this)",
+                t.subtext
+            ),
         );
     }
 

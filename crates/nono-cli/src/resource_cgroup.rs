@@ -129,6 +129,13 @@ impl CgroupLeaf {
                     procs_path.display()
                 ))
             })?;
+        // Record activation so a run under `-v`/RUST_LOG shows the cap was armed
+        // and where (the capabilities block already shows it to the user).
+        tracing::info!(
+            "resource: enforcing {} via cgroup v2 leaf {}",
+            limits.summary(),
+            path.display()
+        );
         Ok(Self { path, procs })
     }
 
@@ -299,7 +306,15 @@ fn teardown(path: &Path) {
             _ => break,
         }
     }
-    let _ = fs::remove_dir(path);
+    if let Err(e) = fs::remove_dir(path) {
+        // A leaf we can't remove (members still live past the reap budget) leaks
+        // an empty cgroup dir. Not fatal — the next run's sweep reclaims it — but
+        // worth a warning since it's otherwise silent.
+        tracing::warn!(
+            "resource: could not remove cgroup leaf {} ({e}); it may leak until a later run sweeps it",
+            path.display()
+        );
+    }
 }
 
 /// Remove leftover `nono.<pid>` leaves under `base` whose supervisor is gone (e.g.

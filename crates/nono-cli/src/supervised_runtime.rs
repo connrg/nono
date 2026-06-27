@@ -297,9 +297,15 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // down.
     #[cfg(target_os = "linux")]
     let cgroup_leaf = match caps.resource_limits() {
-        Some(limits) if !limits.is_empty() => {
-            Some(crate::resource_cgroup::CgroupLeaf::create(limits)?)
-        }
+        Some(limits) if !limits.is_empty() => Some(
+            // Log the fail-closed path: a requested cap we couldn't set up aborts
+            // the run rather than letting it proceed unenforced.
+            crate::resource_cgroup::CgroupLeaf::create(limits).inspect_err(|e| {
+                tracing::error!(
+                    "resource: could not set up the memory cgroup; refusing to run unconfined: {e}"
+                );
+            })?,
+        ),
         _ => None,
     };
 
