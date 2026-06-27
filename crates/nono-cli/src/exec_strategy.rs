@@ -1536,9 +1536,16 @@ pub fn execute_supervised(
             // Let the caller explain this specific exit (e.g. the resource cgroup
             // turning a bare SIGKILL into a memory-cap diagnostic). If it does,
             // the generic footer below is suppressed so the user gets one story.
-            let specialized_diagnostic = on_exit_diagnostic
-                .take()
-                .is_some_and(|hook| hook(exit_code));
+            //
+            // Gated on `!killed_by_timeout`: a watchdog timeout also kills with
+            // SIGKILL (exit 137), the same code an OOM kill produces. Without this
+            // gate the hook could borrow the "memory cap exceeded" story for a
+            // timeout kill that merely coincided with an earlier OOM-reap in the
+            // leaf — attributing the death to the wrong cause.
+            let specialized_diagnostic = !killed_by_timeout
+                && on_exit_diagnostic
+                    .take()
+                    .is_some_and(|hook| hook(exit_code));
 
             // Analyze PTY screen content for sandbox-related errors.
             let pty_screen = pty_proxy
